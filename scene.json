@@ -1,7 +1,10 @@
 {
+  "splat": "../supersplat-viewer/scenes/604b6d93.ply",
   "resolution": [1620, 1000],
   "fov_y_deg": 45.8,
   "background": [0.0, 0.0, 0.0],
+  "collision": "assets/collision/604b6d93.voxel.json",
+  "floor_offset_y": 0.75,
   "cameras": [
     {
       "name": "cam_warehouse_floor",
@@ -12,6 +15,21 @@
       "name": "cam_warehouse_wide",
       "pos": [1.86, -2.85, -15.11],
       "ypr_deg": [5.7, -7.3, 0.0]
+    },
+    {
+      "name": "cam_side_lowangle",
+      "pos": [-3.0, -0.4, 0.85],
+      "ypr_deg": [90.0, 0.0, 0.0]
+    },
+    {
+      "name": "cam_feet_close",
+      "pos": [5.375, -0.55, 2.21],
+      "ypr_deg": [180.0, 0.0, 0.0]
+    },
+    {
+      "name": "cam_user_screenshot_pose",
+      "pos": [-1.51, -1.78, 10.82],
+      "ypr_deg": [154.4, -0.2, 0.0]
     }
   ],
   "npcs": [

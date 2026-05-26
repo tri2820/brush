@@ -17,6 +17,9 @@ mod training_panel;
 mod settings_panel;
 mod settings_popup;
 
+#[cfg(target_os = "macos")]
+pub mod npc_world;
+
 use eframe::egui_wgpu::WgpuConfiguration;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;

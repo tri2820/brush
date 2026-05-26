@@ -17,6 +17,9 @@ use crate::ui::ui_process::{BackgroundStyle, UiProcess};
 use crate::ui::widget_3d::GridWidget;
 use crate::ui::{UiMode, draw_checkerboard};
 
+#[cfg(target_os = "macos")]
+use crate::ui::npc_world::{NpcBlitCallback, NpcBlitResources, NpcWorld};
+
 /// Controls how often the viewport re-renders during training.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderUpdateMode {
@@ -78,6 +81,14 @@ pub struct ScenePanel {
     grid: Option<GridWidget>,
     #[serde(skip)]
     backbuffer: Option<SplatBackbuffer>,
+    /// NPC subsystem owned by the scene panel. Constructed in `init` when a
+    /// `SceneConfig` is present on `UiProcess`; `None` for bare-splat
+    /// invocations. `Arc<Mutex<…>>` because the egui-wgpu callback runs
+    /// on a worker that needs shared access to the world to drive its
+    /// physics + render pipeline.
+    #[serde(skip)]
+    #[cfg(target_os = "macos")]
+    npc_world: Option<Arc<Mutex<NpcWorld>>>,
     #[serde(skip)]
     pub(crate) last_draw: Option<Instant>,
     #[serde(skip)]
@@ -857,6 +868,51 @@ impl AppPane for ScenePanel {
         self.backbuffer = Some(SplatBackbuffer::new(state, process.actor()));
         // Create the settings popup now that we have the base_path
         self.settings_popup = Some(Arc::new(Mutex::new(SettingsPopup::new())));
+
+        // If a SceneConfig was loaded by bin.rs (positional .json), stand
+        // up the NPC subsystem here: load glTF assets onto the GPU,
+        // construct per-NPC runtime state, prep the offscreen render
+        // target, and register the blit pipeline used to composite NPC
+        // pixels over the splat backbuffer.
+        #[cfg(target_os = "macos")]
+        if let Some(scene) = process.scene() {
+            // Default-park the interactive camera at scene.cameras[0]
+            // (the warehouse uses Y-DOWN world coords, so the natural
+            // free-fly default at (0, 0, -2.3) puts you BELOW the floor
+            // looking up — NPCs and floor end up off the top of frame).
+            // Match the first scripted camera so the viewer opens with
+            // the same vantage the recorder captures.
+            if let Some(cam0) = scene.cameras.first() {
+                let ypr = cam0.ypr_deg;
+                let rotation = glam::Quat::from_euler(
+                    glam::EulerRot::YXZ,
+                    ypr[0].to_radians(),
+                    ypr[1].to_radians(),
+                    ypr[2].to_radians(),
+                );
+                process.set_cam_transform(glam::Vec3::from(cam0.pos), rotation);
+                log::info!(
+                    "[viewer] camera defaulted to scene camera '{}' at {:?} ypr={:?}",
+                    cam0.name,
+                    cam0.pos,
+                    cam0.ypr_deg
+                );
+            }
+            match NpcWorld::new(state, scene) {
+                Ok(world) => {
+                    state
+                        .renderer
+                        .write()
+                        .callback_resources
+                        .insert(NpcBlitResources::new(&state.device, state.target_format));
+                    self.npc_world = Some(Arc::new(Mutex::new(world)));
+                    log::info!("[viewer] NPC subsystem initialized");
+                }
+                Err(e) => {
+                    log::warn!("[viewer] failed to init NPC subsystem: {e}");
+                }
+            }
+        }
     }
 
     fn on_message(&mut self, message: &ProcessMessage, process: &UiProcess) {
@@ -1117,6 +1173,54 @@ impl AppPane for ScenePanel {
                         self.splats_dirty,
                     );
                     self.splats_dirty = false;
+                }
+
+                // NPC overlay. Runs physics + animation + mesh render to
+                // an offscreen RGBA8 texture, then a fullscreen-triangle
+                // blit composites it over the splat backbuffer with alpha
+                // blending. Continuous animation needs a per-frame
+                // repaint request so the UI doesn't go idle.
+                #[cfg(target_os = "macos")]
+                if let Some(npc_world) = &self.npc_world {
+                    // Use the shared view-projection helper from
+                    // brush-cli's npc_system module — same convention
+                    // the recorder uses, so the orientation matches.
+                    let aspect = (size.x as f32 / size.y.max(1) as f32).max(0.001);
+                    let view_proj = crate::ui::npc_world::view_projection(
+                        camera.world_to_local(),
+                        camera.fov_y as f32,
+                        aspect,
+                    );
+                    let cam_pos = camera.position;
+
+                    // Render NPCs at the same PIXEL resolution as the
+                    // splat (rect * pixels_per_point) so the splat-depth
+                    // → mesh-depth feed lines up; otherwise the depth
+                    // values land on the wrong pixels.
+                    let ppp = ui.ctx().pixels_per_point();
+                    let pixel_size = glam::uvec2(
+                        (rect.width() * ppp).round() as u32,
+                        (rect.height() * ppp).round() as u32,
+                    );
+                    let splat_depth = self
+                        .backbuffer
+                        .as_ref()
+                        .and_then(|b| b.latest())
+                        .map(|f| f.depth);
+
+                    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        NpcBlitCallback {
+                            world: npc_world.clone(),
+                            view_proj,
+                            cam_pos,
+                            size: pixel_size,
+                            splat_depth,
+                        },
+                    ));
+                    // Keep the animation ticking even when nothing else
+                    // requests a repaint.
+                    ui.ctx().request_repaint();
                 }
 
                 if let Some(grid) = &mut self.grid {

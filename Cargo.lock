@@ -906,7 +906,9 @@ dependencies = [
  "android_logger",
  "anyhow",
  "brush-async",
+ "brush-character",
  "brush-cli",
+ "brush-collision",
  "brush-dataset",
  "brush-process",
  "brush-render",
@@ -1017,6 +1019,7 @@ dependencies = [
  "anyhow",
  "brush-async",
  "brush-character",
+ "brush-collision",
  "brush-process",
  "brush-record",
  "brush-render",
@@ -1038,6 +1041,18 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "wgpu",
+]
+
+[[package]]
+name = "brush-collision"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

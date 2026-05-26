@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 #![cfg(not(target_family = "wasm"))]
 
+#[cfg(target_os = "macos")]
+pub mod npc_system;
+
 use brush_async::Actor;
 use brush_process::DataSource;
 use brush_process::RunningProcess;
@@ -11,7 +14,7 @@ use brush_process::message::TrainMessage;
 use clap::{Args, Error, Parser, builder::ArgPredicate, error::ErrorKind};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -37,7 +40,6 @@ pub struct Cli {
         long,
         default_value = "true",
         default_value_if("source", ArgPredicate::IsPresent, "false"),
-        default_value_if("scene", ArgPredicate::IsPresent, "false"),
         help = "Spawn a viewer to visualize the training"
     )]
     pub with_viewer: bool,
@@ -49,16 +51,17 @@ pub struct Cli {
     pub render: RenderArgs,
 }
 
-/// Arguments for headless rendering or recording. `--scene PATH` is the
-/// single source of truth for camera setup; presence of `--record-frames`
-/// switches from one-PNG-per-camera output to one-mp4-per-camera output.
+/// Arguments for headless rendering or recording. The scene description
+/// lives in the positional argument — pass a `.json` to enable cameras
+/// and NPCs, or a bare splat to render just the geometry. Presence of
+/// `--record-frames` switches from one-PNG-per-camera output to one-mp4-
+/// per-camera output.
 #[derive(Args, Clone, Debug)]
 pub struct RenderArgs {
-    /// JSON config with one or more named cameras. Without
-    /// `--record-frames`, writes one PNG per camera. With it, records
-    /// one mp4 per camera, all frames synchronized to a single
-    /// world-state advance per frame.
-    #[arg(long, value_name = "PATH")]
+    /// Path to the scene JSON. Populated by bin.rs when the positional
+    /// argument is a `.json` file — not a user-facing flag (the
+    /// positional is the single source of truth for scene config).
+    #[arg(skip)]
     pub scene: Option<PathBuf>,
 
     /// Output directory. Per-camera files are written as
@@ -73,38 +76,41 @@ pub struct RenderArgs {
     /// Frames per second of the recorded video.
     #[arg(long, default_value_t = 30)]
     pub record_fps: u32,
+
+    /// Render one PNG per camera in `scene.json` to `output_dir` and exit.
+    /// Without this flag, `brush <scene.json>` opens the interactive viewer.
+    #[arg(long)]
+    pub screenshot: bool,
 }
 
 impl Cli {
     pub fn validate(self) -> Result<Self, Error> {
-        if self.render.scene.is_some() && self.source.is_none() {
-            return Err(Error::raw(
-                ErrorKind::MissingRequiredArgument,
-                "When --scene is set, --source must be provided",
-            ));
-        }
-        if self.render.record_frames.is_some() && self.render.scene.is_none() {
-            return Err(Error::raw(
-                ErrorKind::MissingRequiredArgument,
-                "--record-frames requires --scene to define which cameras to capture",
-            ));
-        }
         if !self.with_viewer && self.source.is_none() {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,
-                "When --with-viewer is false, --source must be provided",
+                "When --with-viewer is false, a source path must be provided",
             ));
         }
+        // `--record-frames` needs cameras, which only come from a scene.json.
+        // We can't tell here whether the positional is `.json` or a bare
+        // splat (it's parsed as a generic DataSource), so the actual
+        // enforcement happens in bin.rs after the scene preflight.
         Ok(self)
     }
 }
 
-/// JSON schema for `--scene PATH`. Defines a set of named cameras the
-/// renderer should produce. Top-level fields are defaults; each camera
-/// can override `resolution` and `fov_y_deg`.
+/// JSON schema for a scene file. Describes everything needed to load a
+/// world: the splat to render, cameras to capture from, NPCs to animate
+/// over the top, and optional collision geometry. Asset paths (splat,
+/// collision, npc.asset) are resolved relative to the scene file's own
+/// directory by [`load_scene_config`], so a scene is self-contained and
+/// portable across machines.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SceneConfig {
+    /// Path to the splat (`.ply` / `.compressed.ply` / etc.) — relative
+    /// paths resolve against the scene file's directory.
+    pub splat: PathBuf,
     #[serde(default = "default_resolution")]
     pub resolution: [u32; 2],
     #[serde(default = "default_fov_y_deg")]
@@ -118,13 +124,57 @@ pub struct SceneConfig {
     #[serde(default)]
     pub npcs: Vec<NpcEntry>,
     /// Optional voxel-octree collision asset (.voxel.json). When set,
-    /// NPCs with a `path` are snapped to the floor each frame: their Y
-    /// is overridden with `floor_y(x, z) + feet_offset`, where
-    /// `feet_offset` is captured once at startup from the authored
-    /// start Y so the original visual offset (model origin to feet) is
-    /// preserved across the path.
+    /// NPCs with a `path` get gravity + capsule pushout each frame so
+    /// they stand on the floor and respect wall/shelf geometry.
     #[serde(default)]
     pub collision: Option<PathBuf>,
+    /// Y-axis bias added to the per-NPC rendered position. Use this to
+    /// compensate for two systematic visual gaps:
+    ///   1. The voxel floor (top of solid voxel) sits *below* the
+    ///      splat's actual visible floor surface — Gaussian splats have
+    ///      a low-opacity "fuzz" layer below the bright surface that
+    ///      the voxelizer (opacity threshold 0.1) doesn't capture.
+    ///   2. The character mesh's lowest vertex is the foot sole, but
+    ///      the visible boot bottom in side-views sits a few cm above
+    ///      that, so the perceived feet-floor gap is ~10 cm bigger
+    ///      than the math predicts.
+    /// Positive values move NPCs *downward* (this scene is Y-DOWN, so
+    /// down = +Y). Tune until the feet visually meet the floor.
+    #[serde(default)]
+    pub floor_offset_y: f32,
+}
+
+/// Read a scene JSON file and rewrite every relative path inside it to
+/// an absolute path resolved against the scene file's own directory.
+/// This is what makes a scene self-contained: you can put `scene.json`
+/// anywhere and its asset references stay correct.
+pub fn load_scene_config(scene_path: &Path) -> anyhow::Result<SceneConfig> {
+    let raw = std::fs::read_to_string(scene_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", scene_path.display()))?;
+    let mut scene: SceneConfig = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("invalid scene config {}: {e}", scene_path.display()))?;
+
+    // Asset paths in the JSON are author-friendly (relative to the scene
+    // file). Promote them to absolute up-front so every downstream
+    // consumer can just read the path without caring about CWD.
+    let base = scene_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("scene path has no parent: {}", scene_path.display()))?;
+    let resolve = |p: &PathBuf| -> PathBuf {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            base.join(p)
+        }
+    };
+    scene.splat = resolve(&scene.splat);
+    if let Some(c) = scene.collision.as_ref() {
+        scene.collision = Some(resolve(c));
+    }
+    for npc in &mut scene.npcs {
+        npc.asset = resolve(&npc.asset);
+    }
+    Ok(scene)
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -533,8 +583,7 @@ pub async fn run_record(
     device: wgpu::Device,
     queue: wgpu::Queue,
 ) -> Result<(), anyhow::Error> {
-    use brush_character::{GpuMaterial, GpuMesh, MeshRenderer, NpcInstance, load_mesh};
-    use brush_collision::VoxelCollision;
+    use crate::npc_system::NpcSystem;
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
@@ -556,16 +605,6 @@ pub async fn run_record(
     let (splats, scene) = load_splats_and_scene(process, &args).await?;
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
-
-    // Optional voxel collision for floor snapping. Loaded once; queried per
-    // NPC per frame in the inner loop.
-    let collision = match &scene.collision {
-        Some(path) => {
-            log::info!("Loading voxel collision: {}", path.display());
-            Some(VoxelCollision::load(path)?)
-        }
-        None => None,
-    };
 
     // Pull splat positions + degree-0 SH coefficients off the GPU so
     // we can build per-NPC ambient probes on the CPU. One-shot at
@@ -604,152 +643,21 @@ pub async fn run_record(
         None
     };
 
-    // Shared mesh renderer state. One per cli invocation; bind groups
-    // and depth target are owned by MeshRenderer.
-    let mut mesh_renderer = MeshRenderer::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
-
-    // Load each unique NPC glb just once. Multiple NPCs may share the
-    // same `asset` path; we keep a HashMap so we only upload one GpuMesh
-    // and one GpuMaterial per file.
-    struct LoadedAsset {
-        mesh_asset: brush_character::MeshAsset,
-        gpu_mesh: GpuMesh,
-        gpu_material: GpuMaterial,
-    }
-    let mut mesh_cache: std::collections::HashMap<PathBuf, LoadedAsset> =
-        std::collections::HashMap::new();
-    for npc in &scene.npcs {
-        if !mesh_cache.contains_key(&npc.asset) {
-            log::info!("Loading character asset {}", npc.asset.display());
-            let asset = load_mesh(&npc.asset)?;
-            let gpu_mesh = GpuMesh::upload(&device, &asset);
-            let gpu_material = mesh_renderer.upload_material(&device, &queue, &asset.material);
-            mesh_cache.insert(
-                npc.asset.clone(),
-                LoadedAsset {
-                    mesh_asset: asset,
-                    gpu_mesh,
-                    gpu_material,
-                },
-            );
-        }
-    }
-
-    // Per-NPC GPU instance: model matrix uniform + skin matrices
-    // storage. T-pose for now; phase 3 swaps the skin matrices each
-    // frame from the animation evaluator.
-    // Per NPC: GPU instance + index of the active animation in
-    // `mesh_cache[asset_path].0.animations` (None = static bind pose).
-    struct NpcRuntime {
-        scene_index: usize,
-        instance: NpcInstance,
-        animation_index: Option<usize>,
-        path: Option<Box<dyn brush_character::Path>>,
-        /// Captured at init: `authored_y - floor_y_at_authored_xz`. When the
-        /// floor snap fires each frame we add this back so the original
-        /// visual offset (model origin to feet) is preserved. `None` means
-        /// the snap is disabled for this NPC — either there's no collision
-        /// asset, or the authored start was outside the voxel grid.
-        feet_offset_y: Option<f32>,
-    }
-    let mut npc_runtime: Vec<NpcRuntime> = Vec::with_capacity(scene.npcs.len());
-    for (i, npc) in scene.npcs.iter().enumerate() {
-        let loaded = mesh_cache.get(&npc.asset).expect("just inserted");
-        let asset = &loaded.mesh_asset;
-        let gpu = &loaded.gpu_mesh;
-        // The supersplat warehouse scene uses Y-DOWN world coords (see
-        // earlier camera calibration: yaw/pitch derived assuming +Y is
-        // down). The Meshy/Mixamo character is Y-UP. Flip it via a
-        // 180° rotation around X so its head points to world -Y.
-        // yaw_deg rotates around the world's "up" (= -Y in this scene),
-        // which after the X-flip is the character's own +Y axis;
-        // applying it on the OUTSIDE keeps yaw_deg behaving like a
-        // normal heading.
-        let rot = glam::Quat::from_rotation_y(npc.yaw_deg.to_radians())
-            * glam::Quat::from_rotation_x(std::f32::consts::PI);
-        let model = glam::Mat4::from_scale_rotation_translation(
-            glam::Vec3::splat(npc.scale),
-            rot,
-            glam::Vec3::from(npc.pos),
-        );
-        // Ambient probe sampled at the NPC's *starting* world
-        // position. As the NPC walks the probe doesn't refresh — for
-        // walks of a few meters in a roughly-uniform interior the
-        // color cast stays consistent and the cost (~one second per
-        // NPC at 1.5M splats in debug) doesn't have to be paid each
-        // frame. P2 follow-up: recompute on a coarse grid as the NPC
-        // moves between zones.
-        let anchor = match &npc.path {
-            Some(PathConfig::Linear { start, .. }) => glam::Vec3::from(*start),
-            None => glam::Vec3::from(npc.pos),
-        };
-        let ambient = match &probe {
+    // NPC subsystem — owns the mesh renderer, asset cache, per-NPC
+    // runtimes, voxel collider, and the physics step. The recorder
+    // supplies the ambient-cube sampler (from the splat probe) and the
+    // BGRA8Unorm color format matching the IOSurface target.
+    let scene = std::sync::Arc::new(scene);
+    let mut npc_system = NpcSystem::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Bgra8Unorm,
+        scene.clone(),
+        |anchor| match &probe {
             Some(p) => compute_ambient_cube(anchor, p),
             None => [[0.5, 0.5, 0.5]; 6],
-        };
-        log::info!(
-            "ambient cube for '{}' at {anchor:?}: {ambient:?}",
-            npc.name
-        );
-        let instance =
-            mesh_renderer.make_instance(&device, gpu, model, npc.color, ambient);
-        let animation_index = match &npc.animation {
-            Some(name) => {
-                let idx = asset.animations.iter().position(|a| &a.name == name);
-                if idx.is_none() {
-                    let available: Vec<_> = asset.animations.iter().map(|a| &a.name).collect();
-                    anyhow::bail!(
-                        "npc '{}': animation '{}' not found in {} (have: {:?})",
-                        npc.name, name, npc.asset.display(), available,
-                    );
-                }
-                idx
-            }
-            None => None,
-        };
-        let path: Option<Box<dyn brush_character::Path>> = match &npc.path {
-            Some(PathConfig::Linear {
-                start,
-                end,
-                duration_s,
-            }) => Some(Box::new(brush_character::LinearPath {
-                start: glam::Vec3::from(*start),
-                end: glam::Vec3::from(*end),
-                duration_s: *duration_s,
-            })),
-            None => None,
-        };
-        // Capture the floor offset at the authored start. Cast +Y (down,
-        // since this scene is Y-DOWN — see the X-flip comment above) from
-        // well above the grid; the hit's Y is the floor, and the difference
-        // from the authored Y is the constant offset we keep applied as the
-        // NPC walks.
-        let feet_offset_y = collision.as_ref().and_then(|c| {
-            let start = match &npc.path {
-                Some(PathConfig::Linear { start, .. }) => glam::Vec3::from(*start),
-                None => glam::Vec3::from(npc.pos),
-            };
-            let origin = glam::vec3(start.x, c.grid_min().y - 0.1, start.z);
-            let max_dist = c.grid_size().y + 1.0;
-            let hit = c.ray_cast(origin, glam::Vec3::Y, max_dist)?;
-            let offset = start.y - hit.pos.y;
-            log::info!(
-                "npc '{}' floor snap: authored_y={:.3}, floor_y={:.3}, offset={:.3}",
-                npc.name,
-                start.y,
-                hit.pos.y,
-                offset
-            );
-            Some(offset)
-        });
-        npc_runtime.push(NpcRuntime {
-            scene_index: i,
-            instance,
-            animation_index,
-            path,
-            feet_offset_y,
-        });
-    }
+        },
+    )?;
 
     struct Cam {
         entry: CameraEntry,
@@ -795,43 +703,12 @@ pub async fn run_record(
         scene.npcs.len(),
     );
 
+    let dt = 1.0 / args.record_fps as f32;
     let t_start = std::time::Instant::now();
-    for frame in 0..total {
-        // World state for this frame. NPCs see the same `t` across
-        // every camera, so all cameras observe identical poses.
-        let world_t = frame as f32 / args.record_fps as f32;
-        for rt in &mut npc_runtime {
-            let npc = &scene.npcs[rt.scene_index];
-            let asset = &mesh_cache.get(&npc.asset).expect("preloaded").mesh_asset;
-
-            // Update the per-instance model matrix from the path if
-            // present, otherwise keep the static (pos, yaw_deg) from
-            // scene.json.
-            if let Some(path) = rt.path.as_deref() {
-                let mut pos = path.position(world_t);
-                if let (Some(c), Some(off)) = (collision.as_ref(), rt.feet_offset_y) {
-                    let origin = glam::vec3(pos.x, c.grid_min().y - 0.1, pos.z);
-                    if let Some(hit) =
-                        c.ray_cast(origin, glam::Vec3::Y, c.grid_size().y + 1.0)
-                    {
-                        pos.y = hit.pos.y + off;
-                    }
-                }
-                let yaw_deg = path.heading_deg(world_t);
-                let rot = glam::Quat::from_rotation_y(yaw_deg.to_radians())
-                    * glam::Quat::from_rotation_x(std::f32::consts::PI);
-                let model = glam::Mat4::from_scale_rotation_translation(
-                    glam::Vec3::splat(npc.scale),
-                    rot,
-                    pos,
-                );
-                rt.instance.set_model(&queue, model, npc.color, rt.instance.ambient_cube);
-            }
-
-            let anim = rt.animation_index.map(|i| &asset.animations[i]);
-            let skin_mats = asset.skeleton.evaluate(anim, world_t);
-            rt.instance.upload_skin(&queue, &skin_mats)?;
-        }
+    for _frame in 0..total {
+        // World state for this frame. NPCs see the same `t` across every
+        // camera, so all cameras observe identical poses.
+        npc_system.tick(dt, &queue)?;
 
         for cam in &mut cams {
             let camera = camera_from_ypr(
@@ -876,30 +753,22 @@ pub async fn run_record(
             let mut frame = cam.recorder.begin_frame()?;
             frame.swizzle_from(&res.buffer, res.offset);
 
-            if !npc_runtime.is_empty() {
-                // Recompute view-projection in the convention the mesh
-                // shader uses. brush's renderer uses +Z forward; for
-                // wgpu clip space we go through `Mat4::perspective_rh`
-                // with the same fov_y and aspect.
+            if !npc_system.runtimes.is_empty() {
                 let aspect = cam.img_size.x as f32 / cam.img_size.y as f32;
-                let proj = glam::Mat4::perspective_rh(
+                let view_proj = crate::npc_system::view_projection(
+                    camera.world_to_local(),
                     cam.fov_y_deg.to_radians() as f32,
                     aspect,
-                    0.05,
-                    1000.0,
                 );
-                let view = glam::Mat4::from(camera.world_to_local());
-                let view_brush_to_wgpu =
-                    glam::Mat4::from_quat(glam::Quat::from_rotation_x(std::f32::consts::PI));
-                let view_proj = proj * view_brush_to_wgpu * view;
-                let cam_pos = camera.position;
 
-                mesh_renderer.set_camera(&queue, view_proj, cam_pos);
+                npc_system
+                    .mesh_renderer
+                    .set_camera(&queue, view_proj, camera.position);
                 // Splat depth → NDC depth into the mesh pass's depth
-                // attachment. Same `near`/`far` we used in the
-                // projection above; mismatch would shift hardware
-                // depth tests off the actual splat surface.
-                mesh_renderer.fill_depth_from_splats(
+                // attachment. Same `near`/`far` the view_projection
+                // helper uses; mismatch would shift hardware depth
+                // tests off the actual splat surface.
+                npc_system.mesh_renderer.fill_depth_from_splats(
                     &device,
                     &queue,
                     frame.color_texture(),
@@ -908,16 +777,8 @@ pub async fn run_record(
                     0.05,
                     1000.0,
                 );
-                let draws: Vec<_> = npc_runtime
-                    .iter()
-                    .map(|rt| {
-                        let asset_path = &scene.npcs[rt.scene_index].asset;
-                        let loaded = mesh_cache.get(asset_path).expect("preloaded");
-                        (&loaded.gpu_mesh, &rt.instance, &loaded.gpu_material)
-                    })
-                    .collect();
                 let mesh_submission =
-                    mesh_renderer.render(&device, &queue, frame.color_texture(), draws);
+                    npc_system.render_npcs(&device, &queue, frame.color_texture(), None);
                 frame.note_submission(mesh_submission);
             }
 
@@ -950,7 +811,7 @@ async fn load_splats_and_scene(
     let scene_path = args
         .scene
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--scene is required"))?;
+        .ok_or_else(|| anyhow::anyhow!("scene config not loaded (expected a .json positional)"))?;
     log::info!("Loading source...");
     while let Some(msg) = process.stream.next().await {
         match msg? {
@@ -974,11 +835,10 @@ async fn load_splats_and_scene(
         splats.sh_degree(),
     );
 
-    let raw = tokio::fs::read_to_string(scene_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", scene_path.display()))?;
-    let scene: SceneConfig = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("invalid scene config {}: {e}", scene_path.display()))?;
+    // Re-parse the scene here (bin.rs has already parsed it once to
+    // derive the splat path) — the cost is a few hundred bytes of JSON,
+    // and downstream code stays simpler by owning a fresh SceneConfig.
+    let scene = load_scene_config(scene_path)?;
     if scene.cameras.is_empty() {
         anyhow::bail!("scene config has no cameras");
     }

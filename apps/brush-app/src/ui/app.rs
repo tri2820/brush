@@ -202,6 +202,7 @@ impl App {
     pub fn new(
         cc: &eframe::CreationContext,
         init_process: Option<brush_process::RunningProcess>,
+        #[cfg(target_os = "macos")] scene: Option<std::sync::Arc<brush_cli::SceneConfig>>,
     ) -> Self {
         let state = cc
             .wgpu_render_state
@@ -219,6 +220,13 @@ impl App {
 
         if let Some(process) = init_process {
             context.connect_to_process(process);
+        }
+
+        // Stash the scene config on the shared context BEFORE pane init —
+        // ScenePanel reads it during init to construct its NPC subsystem.
+        #[cfg(target_os = "macos")]
+        if let Some(scene) = scene {
+            context.set_scene(scene);
         }
 
         cc.egui_ctx

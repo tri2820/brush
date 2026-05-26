@@ -1,11 +1,13 @@
 use anyhow::Result;
 use brush_async::Actor;
+#[cfg(target_os = "macos")]
+use brush_cli::SceneConfig;
 use brush_process::{RunningProcess, message::ProcessMessage, slot::Slot};
 use brush_render::{camera::Camera, gaussian_splats::Splats, kernels::camera_model::CameraModel};
 use burn_wgpu::WgpuDevice;
 use egui::{Response, TextureHandle};
 use glam::{Affine3A, Quat, Vec3};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -188,11 +190,19 @@ impl UiProcess {
     pub fn connect_to_process(&self, process: RunningProcess) {
         {
             let mut inner = self.write();
-            let reset = UiProcessInner::new(
+            #[cfg(target_os = "macos")]
+            let saved_scene = inner.scene.clone();
+            let mut reset = UiProcessInner::new(
                 inner.burn_device.clone(),
                 inner.ui_ctx.clone(),
                 inner.actor.clone(),
             );
+            // Scene config is set once at App startup; preserve it across
+            // process / session resets so NPCs survive a re-load.
+            #[cfg(target_os = "macos")]
+            {
+                reset.scene = saved_scene;
+            }
             *inner = reset;
         }
 
@@ -298,12 +308,31 @@ impl UiProcess {
 
     pub fn reset_session(&self) {
         let mut inner = self.write();
+        #[cfg(target_os = "macos")]
+        let saved_scene = inner.scene.clone();
         *inner = UiProcessInner::new(
             inner.burn_device.clone(),
             inner.ui_ctx.clone(),
             inner.actor.clone(),
         );
+        #[cfg(target_os = "macos")]
+        {
+            inner.scene = saved_scene;
+        }
         inner.session_reset_requested = true;
+    }
+
+    /// Public scene-config accessors. Wired only on macOS today because
+    /// `brush_cli::SceneConfig` and the NPC subsystem are macOS-gated
+    /// (the recorder pipeline lives in `brush-record`).
+    #[cfg(target_os = "macos")]
+    pub fn set_scene(&self, scene: Arc<SceneConfig>) {
+        self.write().scene = Some(scene);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn scene(&self) -> Option<Arc<SceneConfig>> {
+        self.read().scene.clone()
     }
 
     pub fn take_session_reset_request(&self) -> bool {
@@ -338,6 +367,11 @@ struct UiProcessInner {
     ui_ctx: egui::Context,
     burn_device: WgpuDevice,
     actor: Actor,
+    /// Scene description loaded from a `scene.json` positional. Holds
+    /// cameras, NPCs, and collision references. Set once at startup by
+    /// `App::new`; read by `ScenePanel` to construct its NPC subsystem.
+    #[cfg(target_os = "macos")]
+    scene: Option<Arc<SceneConfig>>,
 }
 
 impl UiProcessInner {
@@ -371,6 +405,8 @@ impl UiProcessInner {
             burn_device,
             ui_ctx,
             actor,
+            #[cfg(target_os = "macos")]
+            scene: None,
         }
     }
 

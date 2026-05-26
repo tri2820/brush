@@ -14,6 +14,7 @@ members = [
     "crates/brush-process",
     "crates/brush-record",
     "crates/brush-character",
+    "crates/brush-collision",
     "crates/brush-render",
     "crates/brush-render-bwd",
     "crates/brush-rerun",

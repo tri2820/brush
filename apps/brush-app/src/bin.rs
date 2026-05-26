@@ -8,11 +8,35 @@ mod ui;
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), anyhow::Error> {
-    use brush_cli::Cli;
-    use brush_process::create_process;
+    use brush_cli::{Cli, load_scene_config};
+    use brush_process::{DataSource, create_process};
     use clap::Parser;
 
-    let args = Cli::parse().validate()?;
+    let mut args = Cli::parse().validate()?;
+
+    // Scene preflight: when the positional argument is a `.json`, treat it
+    // as the scene description file. Parse it, hoist the splat path inside
+    // it back into `args.source`, and stash the scene path on
+    // `args.render.scene` so the existing run_record / run_render code
+    // picks it up unchanged.
+    let mut loaded_scene: Option<std::sync::Arc<brush_cli::SceneConfig>> = None;
+    if let Some(DataSource::Path(p)) = &args.source
+        && p.to_lowercase().ends_with(".json")
+    {
+        let scene_path = std::path::PathBuf::from(p);
+        let scene = load_scene_config(&scene_path)?;
+        log::info!(
+            "Loading scene '{}' (splat: {})",
+            scene_path.display(),
+            scene.splat.display()
+        );
+        args.source = Some(DataSource::Path(scene.splat.to_string_lossy().into_owned()));
+        args.render.scene = Some(scene_path);
+        loaded_scene = Some(std::sync::Arc::new(scene));
+    } else if args.render.record_frames.is_some() {
+        // Record requires cameras from a scene.json; a bare splat has none.
+        anyhow::bail!("--record-frames requires a .json scene file as the positional argument");
+    }
 
     #[cfg(target_family = "windows")]
     {
@@ -102,11 +126,17 @@ fn main() -> Result<(), anyhow::Error> {
                 return anyhow::Result::<(), anyhow::Error>::Ok(());
             }
 
-            if args.render.scene.is_some() {
+            // Explicit one-PNG-per-camera batch mode. Without --screenshot,
+            // a scene.json now lands in the interactive viewer instead.
+            if args.render.screenshot {
+                if args.render.scene.is_none() {
+                    anyhow::bail!("--screenshot requires a .json scene file as the positional argument");
+                }
                 brush_process::burn_init_setup().await;
-                let process = init_process.expect("Must provide a source for --scene");
+                let process =
+                    init_process.expect("--screenshot requires a source path");
                 brush_cli::run_render(process, args.render).await?;
-            } else if args.with_viewer {
+            } else if args.with_viewer || args.render.scene.is_some() {
                 use crate::ui::app::App;
 
                 let logger = env_logger::Builder::from_default_env()
@@ -139,7 +169,14 @@ fn main() -> Result<(), anyhow::Error> {
                 eframe::run_native(
                     title,
                     native_options,
-                    Box::new(move |cc| Ok(Box::new(App::new(cc, init_process)))),
+                    Box::new(move |cc| {
+                        Ok(Box::new(App::new(
+                            cc,
+                            init_process,
+                            #[cfg(target_os = "macos")]
+                            loaded_scene,
+                        )))
+                    }),
                 )?;
             } else {
                 brush_process::burn_init_setup().await;

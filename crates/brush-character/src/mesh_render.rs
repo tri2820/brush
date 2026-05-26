@@ -603,6 +603,7 @@ impl MeshRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         color_texture: &wgpu::Texture,
+        clear_color: Option<wgpu::Color>,
         instances: impl IntoIterator<Item = (&'a GpuMesh, &'a NpcInstance, &'a GpuMaterial)>,
     ) -> wgpu::SubmissionIndex {
         let (w, h) = (color_texture.width(), color_texture.height());
@@ -618,6 +619,14 @@ impl MeshRenderer {
         // `fill_depth_from_splats` again to opt back in.
         self.last_depth_filled = false;
 
+        // `Some(color)` → start the pass fresh (viewer's offscreen
+        // texture). `None` → preserve whatever's already there (record
+        // mode, where the splat backdrop was swizzled in before us).
+        let color_load = match clear_color {
+            Some(c) => wgpu::LoadOp::Clear(c),
+            None => wgpu::LoadOp::Load,
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("character mesh pass"),
         });
@@ -629,8 +638,7 @@ impl MeshRenderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        // Preserve the splat backdrop the swizzle wrote.
-                        load: wgpu::LoadOp::Load,
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],

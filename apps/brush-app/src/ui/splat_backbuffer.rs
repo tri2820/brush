@@ -26,8 +26,18 @@ struct LastRenderState {
     img_size: UVec2,
 }
 
+/// Latest pipe output — color tensor plus the matching per-pixel depth
+/// tensor (view-space Z). The NPC mesh pass uses the depth side via
+/// `MeshRenderer::fill_depth_from_splats` so characters get occluded by
+/// foreground splat geometry.
+#[derive(Clone)]
+pub struct SplatFrame {
+    pub color: Tensor<3>,
+    pub depth: Tensor<2>,
+}
+
 pub struct SplatBackbuffer {
-    pipe: AsyncMap<RenderRequest, Tensor<3>>,
+    pipe: AsyncMap<RenderRequest, SplatFrame>,
 }
 
 impl SplatBackbuffer {
@@ -45,7 +55,7 @@ impl SplatBackbuffer {
         let pipe = AsyncMap::new(
             actor,
             async move |req: &RenderRequest| {
-                let (image, _) = render_splats(
+                let (color, aux) = render_splats(
                     req.splats.get(req.state.frame).unwrap(),
                     &req.state.camera,
                     req.state.img_size,
@@ -54,12 +64,21 @@ impl SplatBackbuffer {
                     TextureMode::Packed,
                 )
                 .await;
-                image
+                SplatFrame {
+                    color,
+                    depth: aux.depth_img,
+                }
             },
             |req: &RenderRequest| req.ctx.request_repaint(),
         );
 
         Self { pipe }
+    }
+
+    /// Latest splat frame the pipe has produced. Used by the NPC paint
+    /// callback to fish out the matching depth tensor for occlusion.
+    pub fn latest(&self) -> Option<SplatFrame> {
+        self.pipe.latest()
     }
 
     pub fn paint(
@@ -100,8 +119,8 @@ impl SplatBackbuffer {
             });
         }
 
-        if let Some(image) = self.pipe.latest() {
-            let shape = image.shape();
+        if let Some(frame) = self.pipe.latest() {
+            let shape = frame.color.shape();
             let img_height = shape[0] as u32;
             let img_width = shape[1] as u32;
 
@@ -109,7 +128,7 @@ impl SplatBackbuffer {
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
                     SplatBackbufferPainter {
-                        last_img: image,
+                        last_img: frame.color,
                         img_width,
                         img_height,
                     },

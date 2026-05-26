@@ -1,0 +1,17 @@
+[package]
+name = "brush-collision"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
+glam.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
