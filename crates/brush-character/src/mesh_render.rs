@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
-use crate::gltf_load::MeshAsset;
+use crate::gltf_load::{Material, MeshAsset, TextureImage};
 
 /// GPU buffers + skinning state for one mesh. Reusable across multiple
 /// instances of the same character.
@@ -32,6 +32,9 @@ struct Vertex {
     _pad0: f32,
     normal: [f32; 3],
     _pad1: f32,
+    tangent: [f32; 4],
+    uv: [f32; 2],
+    _pad2: [f32; 2],
     joints: [u32; 4],
     weights: [f32; 4],
 }
@@ -45,6 +48,9 @@ impl GpuMesh {
                 _pad0: 0.0,
                 normal: asset.normals[i].into(),
                 _pad1: 0.0,
+                tangent: asset.tangents[i],
+                uv: asset.texcoords[i],
+                _pad2: [0.0; 2],
                 joints: [
                     asset.joints[i][0] as u32,
                     asset.joints[i][1] as u32,
@@ -101,17 +107,50 @@ pub struct NpcInstance {
     skin_buf_size: u64,
 }
 
+/// Per-mesh material textures + sampler, in their own bind group so
+/// the renderer can swap materials without re-creating instance
+/// bindings. Today: baseColor (sRGB) + normal (linear) + a single
+/// MaterialUniforms for factors / scale.
+pub struct GpuMaterial {
+    bind_group: wgpu::BindGroup,
+    _base_color_view: wgpu::TextureView,
+    _normal_view: wgpu::TextureView,
+    _sampler: wgpu::Sampler,
+    _uniform_buf: wgpu::Buffer,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MaterialUniforms {
+    base_color_factor: [f32; 4],
+    normal_scale: f32,
+    /// 1.0 if baseColor texture is bound, 0.0 otherwise → shader can
+    /// fall back to the factor only.
+    has_base_color_tex: f32,
+    /// 1.0 if normal texture is bound.
+    has_normal_tex: f32,
+    _pad: f32,
+}
+
 /// Camera-level state: view-projection uniform + bind group layout.
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    instance_bgl: wgpu::BindGroupLayout,
+    material_bgl: wgpu::BindGroupLayout,
     camera_buf: wgpu::Buffer,
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
+    /// 1×1 sRGB white used as the baseColor when a glTF material has no
+    /// texture (we sample it and rely on the factor for the final
+    /// color). Shared by every "no baseColor" material.
+    fallback_base_color: wgpu::Texture,
+    /// 1×1 flat normal map (128, 128, 255) interpreted as tangent-space
+    /// (0, 0, 1) — i.e. no perturbation.
+    fallback_normal: wgpu::Texture,
 }
 
 impl MeshRenderer {
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, color_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("character skinned shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -119,8 +158,9 @@ impl MeshRenderer {
             ),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("character bgl"),
+        // Bind group 0: camera + per-instance state (model uniform + skin matrices).
+        let instance_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("character instance bgl"),
             entries: &[
                 // camera (uniform)
                 wgpu::BindGroupLayoutEntry {
@@ -158,39 +198,99 @@ impl MeshRenderer {
             ],
         });
 
+        // Bind group 1: per-material textures + sampler + factors.
+        let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("character material bgl"),
+            entries: &[
+                // base color texture (sRGB → linear on sample)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // normal map (linear)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // shared sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // material uniforms (factors)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("character pl"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&instance_bgl), Some(&material_bgl)],
             immediate_size: 0,
         });
 
+        // Vertex layout (matches the `Vertex` struct): offsets in bytes.
+        // 0: position (vec3 + pad to vec4)
+        // 16: normal (vec3 + pad to vec4)
+        // 32: tangent (vec4)
+        // 48: uv (vec2 + pad to vec4)
+        // 64: joints (uvec4)
+        // 80: weights (vec4)
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                // position
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
-                // normal
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
                     offset: 16,
                     shader_location: 1,
                 },
-                // joints (uint32x4)
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Uint32x4,
+                    format: wgpu::VertexFormat::Float32x4,
                     offset: 32,
                     shader_location: 2,
                 },
-                // weights (float32x4)
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x4,
+                    format: wgpu::VertexFormat::Float32x2,
                     offset: 48,
                     shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Uint32x4,
+                    offset: 64,
+                    shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 80,
+                    shader_location: 5,
                 },
             ],
         };
@@ -244,12 +344,121 @@ impl MeshRenderer {
             mapped_at_creation: false,
         });
 
+        // 1×1 fallback textures for materials missing baseColor / normal.
+        let fallback_base_color = make_solid_texture(
+            device,
+            queue,
+            "fallback baseColor (white)",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            [255, 255, 255, 255],
+        );
+        let fallback_normal = make_solid_texture(
+            device,
+            queue,
+            "fallback normal (flat)",
+            wgpu::TextureFormat::Rgba8Unorm,
+            // Tangent-space (0, 0, 1) → unbiased (128, 128, 255).
+            [128, 128, 255, 255],
+        );
+
         Self {
             pipeline,
-            bind_group_layout,
+            instance_bgl,
+            material_bgl,
             camera_buf,
             depth_view: None,
             depth_size: (0, 0),
+            fallback_base_color,
+            fallback_normal,
+        }
+    }
+
+    /// Upload a `Material` to the GPU as a bind-group-ready `GpuMaterial`.
+    /// Reuse: cache GpuMaterial by glTF source path in the caller.
+    pub fn upload_material(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        material: &Material,
+    ) -> GpuMaterial {
+        let base_color_tex = match &material.base_color {
+            Some(img) => upload_texture(
+                device,
+                queue,
+                "character baseColor",
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                img,
+            ),
+            None => self.fallback_base_color.clone(),
+        };
+        let normal_tex = match &material.normal {
+            Some(img) => upload_texture(
+                device,
+                queue,
+                "character normal",
+                wgpu::TextureFormat::Rgba8Unorm,
+                img,
+            ),
+            None => self.fallback_normal.clone(),
+        };
+
+        let base_color_view = base_color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let normal_view = normal_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("character sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 1,
+            ..Default::default()
+        });
+
+        let uniforms = MaterialUniforms {
+            base_color_factor: material.base_color_factor,
+            normal_scale: material.normal_scale,
+            has_base_color_tex: if material.base_color.is_some() { 1.0 } else { 0.0 },
+            has_normal_tex: if material.normal.is_some() { 1.0 } else { 0.0 },
+            _pad: 0.0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("character material ub"),
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("character material bg"),
+            layout: &self.material_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&base_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        GpuMaterial {
+            bind_group,
+            _base_color_view: base_color_view,
+            _normal_view: normal_view,
+            _sampler: sampler,
+            _uniform_buf: uniform_buf,
         }
     }
 
@@ -295,8 +504,8 @@ impl MeshRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("character bg"),
-            layout: &self.bind_group_layout,
+            label: Some("character instance bg"),
+            layout: &self.instance_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -332,7 +541,7 @@ impl MeshRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         color_texture: &wgpu::Texture,
-        instances: impl IntoIterator<Item = (&'a GpuMesh, &'a NpcInstance)>,
+        instances: impl IntoIterator<Item = (&'a GpuMesh, &'a NpcInstance, &'a GpuMaterial)>,
     ) -> wgpu::SubmissionIndex {
         let (w, h) = (color_texture.width(), color_texture.height());
         self.ensure_depth(device, w, h);
@@ -367,8 +576,9 @@ impl MeshRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for (mesh, inst) in instances {
+            for (mesh, inst, material) in instances {
                 pass.set_bind_group(0, &inst.bind_group, &[]);
+                pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -435,4 +645,89 @@ impl NpcInstance {
         queue.write_buffer(&self.skin_buf, 0, &bytes);
         Ok(())
     }
+}
+
+fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    image: &TextureImage,
+) -> wgpu::Texture {
+    let size = wgpu::Extent3d {
+        width: image.width,
+        height: image.height,
+        depth_or_array_layers: 1,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &image.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(image.width * 4),
+            rows_per_image: Some(image.height),
+        },
+        size,
+    );
+    tex
+}
+
+/// Build a 1×1 texture filled with the given color. Used for material
+/// fallbacks when a glTF material omits a channel.
+fn make_solid_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    color: [u8; 4],
+) -> wgpu::Texture {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &color,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex
 }

@@ -1,9 +1,12 @@
 // Skinned-mesh vertex+fragment for NPC characters.
 //
-// The skinning happens here on the GPU: per vertex we look up 4 joint
-// matrices from a per-instance storage buffer and blend them by weight.
-// Identity skin matrices give a T-pose; an animation evaluator supplies
-// the matrices that produce the walk cycle.
+// GPU linear-blend skinning + glTF baseColor + tangent-space normal
+// mapping. Lighting is two-source diffuse (key + fill) in *linear*
+// color space; we apply manual sRGB encoding at the end because the
+// recorder's IOSurface texture is Bgra8Unorm (non-sRGB), and the
+// splat compositing pipeline implicitly treats its output bytes as
+// sRGB-encoded. Keeping the gamma encode in the shader is the simplest
+// way to make the character match without disturbing the splat path.
 
 struct CameraUniforms {
     view_proj: mat4x4<f32>,
@@ -17,31 +20,46 @@ struct InstanceUniforms {
     _pad: f32,
 };
 
+struct MaterialUniforms {
+    base_color_factor: vec4<f32>,
+    normal_scale: f32,
+    has_base_color_tex: f32,
+    has_normal_tex: f32,
+    _pad: f32,
+};
+
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> instance: InstanceUniforms;
 @group(0) @binding(2) var<storage, read> skin_matrices: array<mat4x4<f32>>;
 
+@group(1) @binding(0) var base_color_tex: texture_2d<f32>;
+@group(1) @binding(1) var normal_tex: texture_2d<f32>;
+@group(1) @binding(2) var mat_sampler: sampler;
+@group(1) @binding(3) var<uniform> material: MaterialUniforms;
+
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
-    @location(2) joints:   vec4<u32>,
-    @location(3) weights:  vec4<f32>,
+    @location(2) tangent:  vec4<f32>,
+    @location(3) uv:       vec2<f32>,
+    @location(4) joints:   vec4<u32>,
+    @location(5) weights:  vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
-    @location(2) color: vec3<f32>,
+    @location(2) world_tangent: vec3<f32>,
+    @location(3) world_bitangent: vec3<f32>,
+    @location(4) uv: vec2<f32>,
 };
 
 fn skin_matrix(j: vec4<u32>, w: vec4<f32>) -> mat4x4<f32> {
-    var m: mat4x4<f32> =
-        skin_matrices[j.x] * w.x +
-        skin_matrices[j.y] * w.y +
-        skin_matrices[j.z] * w.z +
-        skin_matrices[j.w] * w.w;
-    return m;
+    return skin_matrices[j.x] * w.x +
+           skin_matrices[j.y] * w.y +
+           skin_matrices[j.z] * w.z +
+           skin_matrices[j.w] * w.w;
 }
 
 @vertex
@@ -49,28 +67,75 @@ fn vs_main(input: VsIn) -> VsOut {
     let skin = skin_matrix(input.joints, input.weights);
     let local_pos = (skin * vec4<f32>(input.position, 1.0)).xyz;
     let local_normal = (skin * vec4<f32>(input.normal, 0.0)).xyz;
+    let local_tangent = (skin * vec4<f32>(input.tangent.xyz, 0.0)).xyz;
     let world_pos4 = instance.model * vec4<f32>(local_pos, 1.0);
-    let world_normal = (instance.model * vec4<f32>(local_normal, 0.0)).xyz;
+    let world_normal = normalize((instance.model * vec4<f32>(local_normal, 0.0)).xyz);
+    let world_tangent = normalize((instance.model * vec4<f32>(local_tangent, 0.0)).xyz);
+    // glTF: bitangent = cross(normal, tangent) * tangent.w. The .w
+    // sign accounts for mirrored UV charts.
+    let world_bitangent = cross(world_normal, world_tangent) * input.tangent.w;
 
     var out: VsOut;
     out.clip_pos = camera.view_proj * world_pos4;
     out.world_pos = world_pos4.xyz;
-    out.world_normal = normalize(world_normal);
-    out.color = instance.base_color;
+    out.world_normal = world_normal;
+    out.world_tangent = world_tangent;
+    out.world_bitangent = world_bitangent;
+    out.uv = input.uv;
     return out;
+}
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    // Piecewise sRGB encode (IEC 61966-2-1).
+    let cutoff = vec3<f32>(0.0031308);
+    let low = 12.92 * c;
+    let high = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(high, low, c < cutoff);
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Simple two-source diffuse: a key light from above-front, a soft
-    // fill from below. Keeps the character readable against a textured
-    // splat backdrop without going PBR.
-    let n = normalize(in.world_normal);
+    // 1. Base color: texture (hardware-decoded sRGB→linear) × factor,
+    //    falling back to plain factor if no texture is bound.
+    var base_color = material.base_color_factor.rgb;
+    if material.has_base_color_tex > 0.5 {
+        let sampled = textureSample(base_color_tex, mat_sampler, in.uv);
+        base_color *= sampled.rgb;
+    } else {
+        // No texture → fall back to instance tint for variety
+        // (alice/bob can still be visually distinguished).
+        base_color *= instance.base_color;
+    }
+
+    // 2. Tangent-space normal from normal map, brought to world space
+    //    via TBN.
+    var world_normal = normalize(in.world_normal);
+    if material.has_normal_tex > 0.5 {
+        let nm = textureSample(normal_tex, mat_sampler, in.uv).rgb;
+        // [0, 1] → [-1, 1].
+        var tangent_n = nm * 2.0 - vec3<f32>(1.0);
+        tangent_n.x *= material.normal_scale;
+        tangent_n.y *= material.normal_scale;
+        let t = normalize(in.world_tangent);
+        let b = normalize(in.world_bitangent);
+        let n = world_normal;
+        world_normal = normalize(tangent_n.x * t + tangent_n.y * b + tangent_n.z * n);
+    }
+
+    // 3. Linear-space lighting: ambient + key + fill, all in linear.
+    //    These directions are chosen to match an indoors-with-skylight
+    //    feel; once we have splat-derived ambient (PBR P2), this gets
+    //    replaced.
     let key_dir = normalize(vec3<f32>(0.4, 0.8, 0.3));
     let fill_dir = normalize(vec3<f32>(-0.2, -0.5, -0.4));
-    let key = max(dot(n, key_dir), 0.0);
-    let fill = max(dot(n, fill_dir), 0.0) * 0.35;
-    let ambient = 0.4;
-    let lit = in.color * (ambient + key + fill);
-    return vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let key = max(dot(world_normal, key_dir), 0.0);
+    let fill = max(dot(world_normal, fill_dir), 0.0) * 0.35;
+    let ambient = 0.35;
+    let lit = base_color * (ambient + key + fill);
+
+    // 4. sRGB-encode for the non-sRGB IOSurface target. Matches the
+    //    splat path's implicit assumption that bytes-as-stored are
+    //    already sRGB-encoded.
+    let encoded = linear_to_srgb(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+    return vec4<f32>(encoded, 1.0);
 }

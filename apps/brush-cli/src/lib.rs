@@ -454,7 +454,7 @@ pub async fn run_record(
     device: wgpu::Device,
     queue: wgpu::Queue,
 ) -> Result<(), anyhow::Error> {
-    use brush_character::{GpuMesh, MeshRenderer, NpcInstance, load_mesh};
+    use brush_character::{GpuMaterial, GpuMesh, MeshRenderer, NpcInstance, load_mesh};
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
@@ -468,23 +468,36 @@ pub async fn run_record(
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
 
+    // Shared mesh renderer state. One per cli invocation; bind groups
+    // and depth target are owned by MeshRenderer.
+    let mut mesh_renderer = MeshRenderer::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
+
     // Load each unique NPC glb just once. Multiple NPCs may share the
     // same `asset` path; we keep a HashMap so we only upload one GpuMesh
-    // and one MeshAsset per file.
-    let mut mesh_cache: std::collections::HashMap<PathBuf, (brush_character::MeshAsset, GpuMesh)> =
+    // and one GpuMaterial per file.
+    struct LoadedAsset {
+        mesh_asset: brush_character::MeshAsset,
+        gpu_mesh: GpuMesh,
+        gpu_material: GpuMaterial,
+    }
+    let mut mesh_cache: std::collections::HashMap<PathBuf, LoadedAsset> =
         std::collections::HashMap::new();
     for npc in &scene.npcs {
         if !mesh_cache.contains_key(&npc.asset) {
             log::info!("Loading character asset {}", npc.asset.display());
             let asset = load_mesh(&npc.asset)?;
-            let gpu = GpuMesh::upload(&device, &asset);
-            mesh_cache.insert(npc.asset.clone(), (asset, gpu));
+            let gpu_mesh = GpuMesh::upload(&device, &asset);
+            let gpu_material = mesh_renderer.upload_material(&device, &queue, &asset.material);
+            mesh_cache.insert(
+                npc.asset.clone(),
+                LoadedAsset {
+                    mesh_asset: asset,
+                    gpu_mesh,
+                    gpu_material,
+                },
+            );
         }
     }
-
-    // Shared mesh renderer state. One per cli invocation; bind groups
-    // and depth target are owned by MeshRenderer.
-    let mut mesh_renderer = MeshRenderer::new(&device, wgpu::TextureFormat::Bgra8Unorm);
 
     // Per-NPC GPU instance: model matrix uniform + skin matrices
     // storage. T-pose for now; phase 3 swaps the skin matrices each
@@ -499,7 +512,9 @@ pub async fn run_record(
     }
     let mut npc_runtime: Vec<NpcRuntime> = Vec::with_capacity(scene.npcs.len());
     for (i, npc) in scene.npcs.iter().enumerate() {
-        let (asset, gpu) = mesh_cache.get(&npc.asset).expect("just inserted");
+        let loaded = mesh_cache.get(&npc.asset).expect("just inserted");
+        let asset = &loaded.mesh_asset;
+        let gpu = &loaded.gpu_mesh;
         // The supersplat warehouse scene uses Y-DOWN world coords (see
         // earlier camera calibration: yaw/pitch derived assuming +Y is
         // down). The Meshy/Mixamo character is Y-UP. Flip it via a
@@ -601,7 +616,7 @@ pub async fn run_record(
         let world_t = frame as f32 / args.record_fps as f32;
         for rt in &mut npc_runtime {
             let npc = &scene.npcs[rt.scene_index];
-            let (asset, _gpu) = mesh_cache.get(&npc.asset).expect("preloaded");
+            let asset = &mesh_cache.get(&npc.asset).expect("preloaded").mesh_asset;
 
             // Update the per-instance model matrix from the path if
             // present, otherwise keep the static (pos, yaw_deg) from
@@ -679,10 +694,8 @@ pub async fn run_record(
                     .iter()
                     .map(|rt| {
                         let asset_path = &scene.npcs[rt.scene_index].asset;
-                        (
-                            &mesh_cache.get(asset_path).expect("preloaded").1,
-                            &rt.instance,
-                        )
+                        let loaded = mesh_cache.get(asset_path).expect("preloaded");
+                        (&loaded.gpu_mesh, &rt.instance, &loaded.gpu_material)
                     })
                     .collect();
                 let mesh_submission =

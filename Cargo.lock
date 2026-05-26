@@ -229,6 +229,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "approx"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f2a05fd1bd10b2527e20a2cd32d8873d115b8b39fe219ee25f42a8aca6ba278"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,7 +339,7 @@ dependencies = [
  "chrono",
  "half",
  "hashbrown 0.16.1",
- "num-complex",
+ "num-complex 0.4.6",
  "num-integer",
  "num-traits",
 ]
@@ -651,7 +660,7 @@ dependencies = [
  "arg_enum_proc_macro",
  "arrayvec",
  "log",
- "num-rational",
+ "num-rational 0.4.2",
  "num-traits",
  "pastey",
  "rayon",
@@ -670,7 +679,7 @@ dependencies = [
  "arrayvec",
  "log",
  "nom 8.0.0",
- "num-rational",
+ "num-rational 0.4.2",
  "v_frame",
 ]
 
@@ -995,7 +1004,9 @@ dependencies = [
  "bytemuck",
  "glam",
  "gltf",
+ "image",
  "log",
+ "mikktspace",
  "wgpu",
 ]
 
@@ -4330,7 +4341,7 @@ dependencies = [
  "gemm-f16",
  "gemm-f32",
  "gemm-f64",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -4345,7 +4356,7 @@ checksum = "086936dbdcb99e37aad81d320f98f670e53c1e55a98bee70573e83f95beb128c"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -4360,7 +4371,7 @@ checksum = "20c8aeeeec425959bda4d9827664029ba1501a90a0d1e6228e48bef741db3a3f"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -4377,7 +4388,7 @@ dependencies = [
  "dyn-stack",
  "half",
  "libm",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "once_cell",
  "paste",
@@ -4398,7 +4409,7 @@ dependencies = [
  "gemm-common",
  "gemm-f32",
  "half",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -4414,7 +4425,7 @@ checksum = "02e0b8c9da1fbec6e3e3ab2ce6bc259ef18eb5f6f0d3e4edf54b75f9fd41a81c"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -4429,7 +4440,7 @@ checksum = "056131e8f2a521bfab322f804ccd652520c79700d81209e9d9275bbdecaadc6a"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex",
+ "num-complex 0.4.6",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -6048,6 +6059,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mikktspace"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d0b56b403871a8f992ca626d52cc0a690d4841baea8955dc4af6304ac62f8b0"
+dependencies = [
+ "nalgebra",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6165,6 +6185,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nalgebra"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "476d1d59fe02fe54c86356e91650cd892f392782a1cb9fc524ec84f7aa9e1d06"
+dependencies = [
+ "approx",
+ "matrixmultiply",
+ "num-complex 0.3.1",
+ "num-rational 0.3.2",
+ "num-traits",
+ "simba",
+ "typenum",
+]
+
+[[package]]
 name = "natord"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6192,7 +6227,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
 dependencies = [
  "matrixmultiply",
- "num-complex",
+ "num-complex 0.4.6",
  "num-integer",
  "num-traits",
  "portable-atomic",
@@ -6207,7 +6242,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
 dependencies = [
  "matrixmultiply",
- "num-complex",
+ "num-complex 0.4.6",
  "num-integer",
  "num-traits",
  "portable-atomic",
@@ -6330,10 +6365,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
 dependencies = [
  "num-bigint",
- "num-complex",
+ "num-complex 0.4.6",
  "num-integer",
  "num-iter",
- "num-rational",
+ "num-rational 0.4.2",
  "num-traits",
 ]
 
@@ -6344,6 +6379,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-complex"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "747d632c0c558b87dbabbe6a82f3b4ae03720d0646ac5b7b4dae89394be5f2c5"
+dependencies = [
  "num-traits",
 ]
 
@@ -6388,6 +6432,17 @@ name = "num-iter"
 version = "0.1.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
+dependencies = [
+ "autocfg",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12ac428b1cb17fce6f731001d307d351ec70a6d202fc2e60f7d4c5e42d8f4f07"
 dependencies = [
  "autocfg",
  "num-integer",
@@ -7506,7 +7561,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "libm",
- "num-complex",
+ "num-complex 0.4.6",
  "paste",
  "pulp-wasm-simd-flag",
  "raw-cpuid",
@@ -8391,7 +8446,7 @@ checksum = "62fda65f84bc3fc10f07d2969f2146376d791406dddc357ac42f0bba4dbd33a2"
 dependencies = [
  "byteorder",
  "bytes",
- "num-rational",
+ "num-rational 0.4.2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9610,6 +9665,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "simba"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5132a955559188f3d13c9ba831e77c802ddc8782783f050ed0c52f5988b95f4c"
+dependencies = [
+ "approx",
+ "num-complex 0.3.1",
+ "num-traits",
+ "paste",
 ]
 
 [[package]]

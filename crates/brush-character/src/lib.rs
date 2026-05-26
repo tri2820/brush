@@ -18,8 +18,10 @@ mod mesh_render;
 mod path;
 mod skeleton;
 
-pub use gltf_load::{Animation, JointChannel, MeshAsset, Skeleton, Track, load_mesh};
-pub use mesh_render::{GpuMesh, MeshRenderer, NpcInstance};
+pub use gltf_load::{
+    Animation, JointChannel, Material, MeshAsset, Skeleton, TextureImage, Track, load_mesh,
+};
+pub use mesh_render::{GpuMaterial, GpuMesh, MeshRenderer, NpcInstance};
 pub use path::{LinearPath, Path};
 
 #[cfg(test)]
@@ -70,5 +72,15 @@ mod sanity {
             hi = hi.max(*p);
         }
         println!("BBOX: min={lo:?} max={hi:?} size={:?}", hi - lo);
+        let m = &asset.material;
+        println!(
+            "MATERIAL: base_color_factor={:?} normal_scale={} base_color={} normal={}",
+            m.base_color_factor,
+            m.normal_scale,
+            m.base_color.as_ref().map_or("none".into(), |t| format!("{}x{}", t.width, t.height)),
+            m.normal.as_ref().map_or("none".into(), |t| format!("{}x{}", t.width, t.height)),
+        );
+        assert_eq!(asset.texcoords.len(), asset.positions.len());
+        assert_eq!(asset.tangents.len(), asset.positions.len());
     }
 }

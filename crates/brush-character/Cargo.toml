@@ -9,8 +9,15 @@ license.workspace = true
 anyhow.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
-gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
+gltf = { version = "1.4", default-features = false, features = [
+    "import",
+    "utils",
+    "names",
+    "extras",
+] }
+image.workspace = true
 log.workspace = true
+mikktspace = "0.3"
 wgpu = { workspace = true, features = ["wgsl"] }
 
 [lints]

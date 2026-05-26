@@ -15,6 +15,14 @@ pub struct MeshAsset {
     pub positions: Vec<Vec3>,
     /// Per-vertex normal (object-local).
     pub normals: Vec<Vec3>,
+    /// Per-vertex UV coordinates (TEXCOORD_0). Zero-filled if absent.
+    pub texcoords: Vec<[f32; 2]>,
+    /// Per-vertex tangents. xyz is the tangent direction (object-local),
+    /// w is the bitangent sign (+1 or -1). When the glTF doesn't ship
+    /// TANGENT, we generate them with the MikkTSpace algorithm so that
+    /// normal-map sampling matches the convention DCC tools (Blender,
+    /// Substance) and Mixamo expect.
+    pub tangents: Vec<[f32; 4]>,
     /// Per-vertex 4 joint indices (into `skeleton.joints`).
     pub joints: Vec<[u16; 4]>,
     /// Per-vertex 4 joint weights, expected to sum to ~1.
@@ -25,8 +33,37 @@ pub struct MeshAsset {
     pub skeleton: Skeleton,
     /// Animations keyed by name.
     pub animations: Vec<Animation>,
+    /// Material data, ready for GPU upload.
+    pub material: Material,
     /// Source filename, for diagnostics.
     pub source: String,
+}
+
+/// CPU-side material data for the primitive. Currently extracts the
+/// PBR metallic-roughness channels we care about. Texture image data
+/// is decoded into row-major RGBA8.
+#[derive(Debug, Clone)]
+pub struct Material {
+    /// sRGB-encoded RGBA. None means "no texture, use base_color_factor".
+    pub base_color: Option<TextureImage>,
+    /// linear RGBA, normal map in tangent space (xyz). None means flat.
+    pub normal: Option<TextureImage>,
+    /// Per-material linear-RGBA factor multiplied with the baseColor
+    /// sample (or used directly when no texture is set).
+    pub base_color_factor: [f32; 4],
+    /// Scale factor on the normal map's xy delta (typically 1.0).
+    pub normal_scale: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextureImage {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, 4 bytes per pixel (RGBA8). For sRGB textures these
+    /// bytes are sRGB-encoded; upload as `Rgba8UnormSrgb` to get
+    /// hardware linearization on sample. For linear textures (normal,
+    /// MR), upload as `Rgba8Unorm`.
+    pub rgba: Vec<u8>,
 }
 
 /// Joint hierarchy. Joint index 0..N-1 is "joint N"; `parents[i]` is
@@ -111,7 +148,7 @@ impl<V: Copy> Track<V> {
 }
 
 pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
-    let (doc, buffers, _images) = gltf::import(path)?;
+    let (doc, buffers, images) = gltf::import(path)?;
     let source = path.display().to_string();
 
     // Pick the first skinned mesh primitive in the document.
@@ -167,6 +204,44 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
         .ok_or_else(|| anyhow!("primitive missing indices"))?
         .into_u32()
         .collect();
+
+    // UVs: required for sampling material textures. Zero-fill if the
+    // glTF omits them so the rest of the pipeline still works.
+    let texcoords: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
+        Some(it) => it.into_f32().collect(),
+        None => vec![[0.0, 0.0]; positions.len()],
+    };
+
+    // Tangents: glTF can provide TANGENT explicitly. Mixamo typically
+    // doesn't ship them, so we'll either read them or generate via
+    // MikkTSpace below.
+    let tangents: Vec<[f32; 4]> = if let Some(it) = reader.read_tangents() {
+        it.collect()
+    } else {
+        generate_tangents(&positions, &normals, &texcoords, &indices)
+    };
+
+    // Material: extract the PBR baseColor + normal channels we render.
+    let material_data = prim.material();
+    let pbr = material_data.pbr_metallic_roughness();
+    let base_color_factor = pbr.base_color_factor();
+    let base_color = pbr.base_color_texture().and_then(|info| {
+        decode_image(&doc, &images, info.texture().source().index())
+    });
+    let (normal, normal_scale) = match material_data.normal_texture() {
+        Some(info) => (
+            decode_image(&doc, &images, info.texture().source().index()),
+            info.scale(),
+        ),
+        None => (None, 1.0),
+    };
+
+    let material = Material {
+        base_color,
+        normal,
+        base_color_factor,
+        normal_scale,
+    };
 
     // Skeleton: enumerate the skin's joints, capture each one's bind
     // TRS and inverse-bind matrix, and resolve parent pointers among
@@ -264,29 +339,12 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
     // commonly bake a cm→m scale into such an ancestor, which our
     // skinning math then needs to be aware of.
     // Walk above the topmost joint to collect the ancestor chain
-    // transform (typically a single "Armature" node carrying scale +
-    // pre-rotation in Mixamo exports). The skin's inverseBindMatrices
-    // are computed against the *global* bind pose per spec, so this
-    // transform has to be re-applied when composing the global per
-    // frame.
-    let armature = if let Some(root_joint) = skin_joints.first() {
-        let mut ancestor =
-            doc.nodes().find(|n| n.children().any(|c| c.index() == root_joint.index()));
-        let mut m = Mat4::IDENTITY;
-        while let Some(n) = ancestor {
-            let (t, r, s) = n.transform().decomposed();
-            let local = Mat4::from_scale_rotation_translation(
-                Vec3::from(s),
-                Quat::from_array(r),
-                Vec3::from(t),
-            );
-            m = local * m;
-            ancestor = doc.nodes().find(|p| p.children().any(|c| c.index() == n.index()));
-        }
-        m
-    } else {
-        Mat4::IDENTITY
-    };
+    // transform (typically a single "Armature" node carrying cm→m
+    // scale + pre-rotation in Mixamo exports). The skin's
+    // inverseBindMatrices are computed against the *global* bind pose
+    // per spec, so this transform has to be re-applied when composing
+    // the global per frame.
+    let armature = compute_armature_transform(&doc, &skin_joints);
 
     log::info!(
         "Loaded glb '{}': mesh '{}' prim {}, {} vtx, {} tri, {} joints, {} animations",
@@ -302,6 +360,8 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
     Ok(MeshAsset {
         positions,
         normals,
+        texcoords,
+        tangents,
         joints,
         weights,
         indices,
@@ -310,8 +370,126 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
             armature,
         },
         animations,
+        material,
         source,
     })
+}
+
+/// Decode a glTF image (which gltf-rs has already extracted as raw
+/// pixel data) into row-major RGBA8.
+fn decode_image(
+    _doc: &gltf::Document,
+    images: &[gltf::image::Data],
+    index: usize,
+) -> Option<TextureImage> {
+    let img = images.get(index)?;
+    let (width, height) = (img.width, img.height);
+
+    // gltf-rs produces these formats per the spec, depending on the
+    // source (PNG/JPEG/...). Expand everything to RGBA8 since the GPU
+    // upload path is uniform.
+    use gltf::image::Format;
+    let rgba: Vec<u8> = match img.format {
+        Format::R8G8B8A8 => img.pixels.clone(),
+        Format::R8G8B8 => {
+            let mut out = Vec::with_capacity((width * height * 4) as usize);
+            for px in img.pixels.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            out
+        }
+        Format::R8 => {
+            let mut out = Vec::with_capacity((width * height * 4) as usize);
+            for &g in &img.pixels {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+            out
+        }
+        Format::R8G8 => {
+            let mut out = Vec::with_capacity((width * height * 4) as usize);
+            for px in img.pixels.chunks_exact(2) {
+                out.extend_from_slice(&[px[0], px[1], 0, 255]);
+            }
+            out
+        }
+        other => {
+            log::warn!("unsupported glTF image format {other:?}, skipping");
+            return None;
+        }
+    };
+    Some(TextureImage { width, height, rgba })
+}
+
+/// Generate tangents with MikkTSpace. Required when the glb omits the
+/// TANGENT attribute (Mixamo files typically do). The algorithm needs
+/// a flat per-triangle-corner view of the mesh; we deinterleave once
+/// here, run it, and re-aggregate into per-vertex tangents (matching
+/// our other per-vertex attribute layout).
+fn generate_tangents(
+    positions: &[Vec3],
+    normals: &[Vec3],
+    texcoords: &[[f32; 2]],
+    indices: &[u32],
+) -> Vec<[f32; 4]> {
+    use mikktspace::Geometry;
+
+    struct G<'a> {
+        positions: &'a [Vec3],
+        normals: &'a [Vec3],
+        texcoords: &'a [[f32; 2]],
+        indices: &'a [u32],
+        tangents: Vec<[f32; 4]>,
+    }
+    impl<'a> Geometry for G<'a> {
+        fn num_faces(&self) -> usize {
+            self.indices.len() / 3
+        }
+        fn num_vertices_of_face(&self, _face: usize) -> usize {
+            3
+        }
+        fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+            self.positions[self.indices[face * 3 + vert] as usize].into()
+        }
+        fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+            self.normals[self.indices[face * 3 + vert] as usize].into()
+        }
+        fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+            self.texcoords[self.indices[face * 3 + vert] as usize]
+        }
+        fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
+            self.tangents[self.indices[face * 3 + vert] as usize] = tangent;
+        }
+    }
+
+    let mut geo = G {
+        positions,
+        normals,
+        texcoords,
+        indices,
+        tangents: vec![[1.0, 0.0, 0.0, 1.0]; positions.len()],
+    };
+    mikktspace::generate_tangents(&mut geo);
+    geo.tangents
+}
+
+fn compute_armature_transform(doc: &gltf::Document, skin_joints: &[gltf::Node]) -> Mat4 {
+    let Some(root_joint) = skin_joints.first() else {
+        return Mat4::IDENTITY;
+    };
+    let mut ancestor = doc
+        .nodes()
+        .find(|n| n.children().any(|c| c.index() == root_joint.index()));
+    let mut m = Mat4::IDENTITY;
+    while let Some(n) = ancestor {
+        let (t, r, s) = n.transform().decomposed();
+        let local =
+            Mat4::from_scale_rotation_translation(Vec3::from(s), Quat::from_array(r), Vec3::from(t));
+        m = local * m;
+        ancestor = doc
+            .nodes()
+            .find(|p| p.children().any(|c| c.index() == n.index()));
+    }
+    m
 }
 
 fn reader_inverse_binds(
