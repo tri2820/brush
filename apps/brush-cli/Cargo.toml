@@ -11,7 +11,13 @@ brush-process.path = "../../crates/brush-process"
 brush-render.path = "../../crates/brush-render"
 
 burn.workspace = true
+burn-cubecl.workspace = true
+burn-wgpu.workspace = true
+wgpu.workspace = true
 indicatif.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+brush-record.path = "../../crates/brush-record"
 indicatif-log-bridge = "0.2"
 clap.workspace = true
 tracing.workspace = true

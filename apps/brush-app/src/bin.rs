@@ -55,6 +55,53 @@ fn main() -> Result<(), anyhow::Error> {
                 })
             });
 
+            #[cfg(target_os = "macos")]
+            if args.render.record_output.is_some() {
+                // Build wgpu Instance/Adapter/Device/Queue manually so we
+                // own handles the recorder (IOSurface texture import,
+                // swizzle compute) can share with burn.
+                let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
+                idesc.backends = wgpu::Backends::METAL;
+                let instance = wgpu::Instance::new(idesc);
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        ..Default::default()
+                    })
+                    .await?;
+                // Brush's rasterizer needs 512-thread workgroups, 9
+                // storage buffers per stage, and SUBGROUP/etc. features
+                // it enables internally — match whatever the adapter
+                // supports. Plus BGRA8UNORM_STORAGE for the recorder's
+                // IOSurface storage-texture write.
+                let adapter_limits = adapter.limits();
+                let adapter_features = adapter.features();
+                // SAFETY: enabling experimental features acknowledges
+                // that some wgpu features (RAY_QUERY, MESH_SHADER, etc.)
+                // may have UB-containing bugs. None of those are used in
+                // brush's render path or in brush-record's swizzle, but
+                // burn's adapter enumeration surfaces them so we have to
+                // allow them through to match the adapter's full feature
+                // set that burn expects.
+                let experimental_features = unsafe { wgpu::ExperimentalFeatures::enabled() };
+                let (device, queue) = adapter
+                    .request_device(&wgpu::DeviceDescriptor {
+                        label: Some("brush-record device"),
+                        required_features: adapter_features | wgpu::Features::BGRA8UNORM_STORAGE,
+                        required_limits: adapter_limits,
+                        experimental_features,
+                        ..Default::default()
+                    })
+                    .await?;
+                // `burn_init_device` consumes adapter; clones of
+                // device/queue stay for our recorder.
+                brush_process::burn_init_device(adapter, device.clone(), queue.clone());
+                let process = init_process.expect("Must provide a source for --record-output");
+                brush_cli::run_record(process, args.render, device, queue).await?;
+                return anyhow::Result::<(), anyhow::Error>::Ok(());
+            }
+
             if args.render.render_output.is_some() || args.render.scene.is_some() {
                 brush_process::burn_init_setup().await;
                 let process = init_process.expect("Must provide a source for render mode");

@@ -12,6 +12,7 @@ members = [
     "crates/brush-loss",
     "crates/brush-prefix-sum",
     "crates/brush-process",
+    "crates/brush-record",
     "crates/brush-render",
     "crates/brush-render-bwd",
     "crates/brush-rerun",

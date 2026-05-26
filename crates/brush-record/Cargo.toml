@@ -1,0 +1,47 @@
+[package]
+name = "brush-record"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+# Inherit the workspace wgpu dep (pinned to the brush fork), and tack on
+# the wgsl + metal HAL features we need locally.
+wgpu = { workspace = true, features = ["wgsl", "metal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Use default features on objc2-* crates: their feature graphs are huge
+# (177+ features each for the framework wrappers) and feature-gating by
+# class name is brittle across the 0.3 series. The bloat is acceptable
+# — these crates are header-only wrappers around system frameworks.
+objc2 = "0.6.3"
+objc2-foundation = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-metal = { version = "0.3.2", features = [
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "objc2-io-surface",
+] }
+objc2-core-video = { version = "0.3.2", features = [
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVPixelBufferIOSurface",
+    "objc2-io-surface",
+] }
+objc2-core-media = "0.3.2"
+objc2-io-surface = "0.3.2"
+objc2-av-foundation = { version = "0.3.2", features = [
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+
+[lints]
+workspace = true

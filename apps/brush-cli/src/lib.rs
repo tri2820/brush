@@ -35,6 +35,7 @@ pub struct Cli {
         default_value_if("source", ArgPredicate::IsPresent, "false"),
         default_value_if("render_output", ArgPredicate::IsPresent, "false"),
         default_value_if("scene", ArgPredicate::IsPresent, "false"),
+        default_value_if("record_output", ArgPredicate::IsPresent, "false"),
         help = "Spawn a viewer to visualize the training"
     )]
     pub with_viewer: bool,
@@ -66,6 +67,31 @@ pub struct RenderArgs {
     /// as `{output_dir}/{camera.name}.png`.
     #[arg(long, value_name = "DIR", default_value = "./out")]
     pub output_dir: PathBuf,
+
+    /// (macOS only) Record an H.265 .mp4 to this path. Uses real
+    /// GPU-side recording: brush's rasterized tensor → IOSurface-backed
+    /// Metal texture → VideoToolbox encoder, no CPU pixel touch.
+    #[arg(long, value_name = "PATH")]
+    pub record_output: Option<PathBuf>,
+
+    /// Number of frames to record. Required with --record-output.
+    #[arg(long, default_value_t = 60)]
+    pub record_frames: u32,
+
+    /// Frames per second of the output video.
+    #[arg(long, default_value_t = 30)]
+    pub record_fps: u32,
+
+    /// When recording with `--scene`, which camera (by `name`) to
+    /// follow. Ignored otherwise; the single-camera flags drive it.
+    #[arg(long)]
+    pub record_camera: Option<String>,
+
+    /// Optional yaw sweep across the recording window, in degrees.
+    /// `0` means a static shot; the default 0 ensures we don't add
+    /// unexpected camera motion.
+    #[arg(long, default_value_t = 0.0)]
+    pub record_yaw_sweep_deg: f32,
 
     /// Camera position in world space, "x,y,z".
     #[arg(long, value_name = "X,Y,Z", default_value = "0,0,-2.5")]
@@ -134,12 +160,14 @@ fn parse_resolution(s: &str) -> Result<glam::UVec2, String> {
 
 impl Cli {
     pub fn validate(self) -> Result<Self, Error> {
-        if (self.render.render_output.is_some() || self.render.scene.is_some())
+        if (self.render.render_output.is_some()
+            || self.render.scene.is_some()
+            || self.render.record_output.is_some())
             && self.source.is_none()
         {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,
-                "When --render-output or --scene is set, --source must be provided",
+                "When --render-output / --scene / --record-output is set, --source must be provided",
             ));
         }
         if !self.with_viewer && self.source.is_none() {
@@ -484,11 +512,11 @@ pub async fn run_render(
             )
             .await?;
         }
-    } else {
+    } else if args.render_output.is_some() {
         let output = args
             .render_output
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("expected --render-output or --scene"))?;
+            .expect("render_output checked");
         let camera = build_camera(&args);
         log::info!(
             "Rendering at {}x{} → {}",
@@ -499,6 +527,160 @@ pub async fn run_render(
         render_and_save(splats, &camera, args.resolution, args.background.0, output).await?;
     }
 
+    Ok(())
+}
+
+/// Drive the recording pipeline: load the source, then render `record_frames`
+/// frames to an .mp4 via the GPU-side zero-copy path (Buffer → IOSurface
+/// texture → VideoToolbox). macOS-only.
+#[cfg(target_os = "macos")]
+pub async fn run_record(
+    mut process: RunningProcess,
+    args: RenderArgs,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<(), anyhow::Error> {
+    use brush_record::{Codec, Recorder, RecorderConfig};
+    use brush_render::{TextureMode, gaussian_splats::render_splats};
+    use brush_render::burn_glue::resolve_to_cube_float;
+
+    let output = args
+        .record_output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("record_output unset"))?;
+
+    log::info!("Loading source for recording...");
+    while let Some(msg) = process.stream.next().await {
+        match msg? {
+            ProcessMessage::DoneLoading => break,
+            ProcessMessage::StartLoading { training, .. } if training => {
+                anyhow::bail!(
+                    "--record-output expects a single .ply / .compressed.ply, not a training dataset"
+                );
+            }
+            ProcessMessage::Warning { error } => log::warn!("{error}"),
+            _ => {}
+        }
+    }
+    let splats = process
+        .splat_view
+        .latest()
+        .ok_or_else(|| anyhow::anyhow!("no splats loaded"))?;
+
+    // Resolve the base camera (single-camera flags) or pick the named
+    // camera out of --scene.
+    let (base_pos, base_ypr, fov_y_deg, img_size, background) =
+        if let Some(scene_path) = args.scene.as_ref() {
+            let raw = tokio::fs::read_to_string(scene_path).await?;
+            let scene: SceneConfig = serde_json::from_str(&raw)?;
+            let want = args
+                .record_camera
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--scene with --record-output requires --record-camera <name>"))?;
+            let entry = scene
+                .cameras
+                .iter()
+                .find(|c| c.name == want)
+                .ok_or_else(|| anyhow::anyhow!("camera '{want}' not found in scene"))?;
+            let img_size = entry
+                .resolution
+                .map(|[w, h]| glam::uvec2(w, h))
+                .unwrap_or_else(|| glam::uvec2(scene.resolution[0], scene.resolution[1]));
+            (
+                glam::Vec3::from(entry.pos),
+                glam::Vec3::from(entry.ypr_deg),
+                entry.fov_y_deg.unwrap_or(scene.fov_y_deg),
+                img_size,
+                glam::Vec3::from(scene.background),
+            )
+        } else {
+            (
+                args.camera_pos.0,
+                args.camera_ypr_deg
+                    .map(|v| v.0)
+                    .ok_or_else(|| anyhow::anyhow!("--record-output requires --camera-ypr-deg or --scene"))?,
+                args.fov_y_deg,
+                args.resolution,
+                args.background.0,
+            )
+        };
+
+    let mut recorder = Recorder::new(
+        device.clone(),
+        queue.clone(),
+        output,
+        RecorderConfig {
+            width: img_size.x,
+            height: img_size.y,
+            fps: args.record_fps,
+            codec: Codec::Hevc,
+        },
+    )?;
+
+    let total = args.record_frames.max(1);
+    log::info!(
+        "Recording {} frames at {} fps, {}x{} → {}",
+        total,
+        args.record_fps,
+        img_size.x,
+        img_size.y,
+        output.display(),
+    );
+
+    let t_start = std::time::Instant::now();
+    for frame in 0..total {
+        // Optional yaw sweep so successive frames differ even on a
+        // static-camera shot (useful for sanity-checking pipelining).
+        let t = if total > 1 {
+            frame as f32 / (total - 1) as f32
+        } else {
+            0.0
+        };
+        let ypr = glam::vec3(
+            base_ypr.x + args.record_yaw_sweep_deg * (t - 0.5),
+            base_ypr.y,
+            base_ypr.z,
+        );
+        let camera = camera_from_ypr(base_pos, ypr, fov_y_deg, img_size);
+
+        // Packed mode: output is [h, w, 1] f32 whose bytes are u32
+        // RGBA8 packed values — exactly what the swizzle shader reads.
+        let (tensor, _aux) = render_splats(
+            splats.clone(),
+            &camera,
+            img_size,
+            background,
+            None,
+            TextureMode::Packed,
+        )
+        .await;
+
+        // Drain fusion to get a concrete CubeTensor with a real handle,
+        // then dig out the underlying wgpu::Buffer to feed the swizzle
+        // shader.
+        let cube = resolve_to_cube_float(tensor);
+        let resource = cube
+            .client
+            .get_resource(cube.handle.clone())
+            .map_err(|e| anyhow::anyhow!("get_resource failed: {e:?}"))?;
+        // brush's render commands are merely submitted by this point;
+        // fence them before the swizzle reads the buffer, otherwise the
+        // shader sees the buffer's initial (zero) state.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        // ManagedResource wraps the underlying server resource (which
+        // holds the wgpu::Buffer); `.resource()` exposes it.
+        let res = resource.resource();
+        recorder.write_frame(&res.buffer, res.offset)?;
+    }
+    recorder.finish().await?;
+
+    let elapsed = t_start.elapsed();
+    log::info!(
+        "Wrote {} frames in {:.2?} ({:.1} fps)",
+        total,
+        elapsed,
+        total as f64 / elapsed.as_secs_f64(),
+    );
     Ok(())
 }
 
