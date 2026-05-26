@@ -143,10 +143,12 @@ pub struct NpcEntry {
     pub name: String,
     /// Path to the glTF .glb file.
     pub asset: PathBuf,
-    /// Static world-space placement (overridden by `path` in later phases).
+    /// Static world-space placement. Overridden each frame by `path`
+    /// if one is set.
     #[serde(default)]
     pub pos: [f32; 3],
-    /// Yaw degrees around +Y axis. Pitch/roll fixed to 0.
+    /// Yaw degrees around +Y axis. Pitch/roll fixed to 0. Overridden
+    /// each frame by `path.heading_deg(t)` if a path is set.
     #[serde(default)]
     pub yaw_deg: f32,
     /// Uniform scale applied to the mesh.
@@ -159,6 +161,23 @@ pub struct NpcEntry {
     /// Optional name of an animation in the glb to play.
     #[serde(default)]
     pub animation: Option<String>,
+    /// Optional scripted motion path. When present, drives the NPC's
+    /// position and heading each frame.
+    #[serde(default)]
+    pub path: Option<PathConfig>,
+}
+
+/// JSON-tagged path config. The `type` field selects the variant.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathConfig {
+    /// Constant-velocity straight line from `start` to `end` over
+    /// `duration_s`. Loops by wrapping `t` modulo duration.
+    Linear {
+        start: [f32; 3],
+        end: [f32; 3],
+        duration_s: f32,
+    },
 }
 
 fn default_resolution() -> [u32; 2] {
@@ -476,6 +495,7 @@ pub async fn run_record(
         scene_index: usize,
         instance: NpcInstance,
         animation_index: Option<usize>,
+        path: Option<Box<dyn brush_character::Path>>,
     }
     let mut npc_runtime: Vec<NpcRuntime> = Vec::with_capacity(scene.npcs.len());
     for (i, npc) in scene.npcs.iter().enumerate() {
@@ -510,10 +530,23 @@ pub async fn run_record(
             }
             None => None,
         };
+        let path: Option<Box<dyn brush_character::Path>> = match &npc.path {
+            Some(PathConfig::Linear {
+                start,
+                end,
+                duration_s,
+            }) => Some(Box::new(brush_character::LinearPath {
+                start: glam::Vec3::from(*start),
+                end: glam::Vec3::from(*end),
+                duration_s: *duration_s,
+            })),
+            None => None,
+        };
         npc_runtime.push(NpcRuntime {
             scene_index: i,
             instance,
             animation_index,
+            path,
         });
     }
 
@@ -566,10 +599,26 @@ pub async fn run_record(
         // World state for this frame. NPCs see the same `t` across
         // every camera, so all cameras observe identical poses.
         let world_t = frame as f32 / args.record_fps as f32;
-        for rt in &npc_runtime {
-            let (asset, _gpu) = mesh_cache
-                .get(&scene.npcs[rt.scene_index].asset)
-                .expect("preloaded");
+        for rt in &mut npc_runtime {
+            let npc = &scene.npcs[rt.scene_index];
+            let (asset, _gpu) = mesh_cache.get(&npc.asset).expect("preloaded");
+
+            // Update the per-instance model matrix from the path if
+            // present, otherwise keep the static (pos, yaw_deg) from
+            // scene.json.
+            if let Some(path) = rt.path.as_deref() {
+                let pos = path.position(world_t);
+                let yaw_deg = path.heading_deg(world_t);
+                let rot = glam::Quat::from_rotation_y(yaw_deg.to_radians())
+                    * glam::Quat::from_rotation_x(std::f32::consts::PI);
+                let model = glam::Mat4::from_scale_rotation_translation(
+                    glam::Vec3::splat(npc.scale),
+                    rot,
+                    pos,
+                );
+                rt.instance.set_model(&queue, model, npc.color);
+            }
+
             let anim = rt.animation_index.map(|i| &asset.animations[i]);
             let skin_mats = asset.skeleton.evaluate(anim, world_t);
             rt.instance.upload_skin(&queue, &skin_mats)?;
