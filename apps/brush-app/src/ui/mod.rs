@@ -20,6 +20,9 @@ mod settings_popup;
 #[cfg(target_os = "macos")]
 pub mod npc_world;
 
+#[cfg(target_os = "macos")]
+pub mod voxel_overlay;
+
 use eframe::egui_wgpu::WgpuConfiguration;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;

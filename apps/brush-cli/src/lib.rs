@@ -142,6 +142,13 @@ pub struct SceneConfig {
     /// down = +Y). Tune until the feet visually meet the floor.
     #[serde(default)]
     pub floor_offset_y: f32,
+    /// Optional `.collision.glb` triangle mesh of the voxel collision
+    /// surface (emitted by `splat-transform … -K faces`). When set,
+    /// the viewer can toggle it on with the `V` key to overlay where
+    /// the collider thinks the floor / walls are. Pure debug — no
+    /// runtime cost when toggled off.
+    #[serde(default)]
+    pub voxel_mesh_overlay: Option<PathBuf>,
 }
 
 /// Read a scene JSON file and rewrite every relative path inside it to
@@ -170,6 +177,9 @@ pub fn load_scene_config(scene_path: &Path) -> anyhow::Result<SceneConfig> {
     scene.splat = resolve(&scene.splat);
     if let Some(c) = scene.collision.as_ref() {
         scene.collision = Some(resolve(c));
+    }
+    if let Some(c) = scene.voxel_mesh_overlay.as_ref() {
+        scene.voxel_mesh_overlay = Some(resolve(c));
     }
     for npc in &mut scene.npcs {
         npc.asset = resolve(&npc.asset);

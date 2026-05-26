@@ -20,6 +20,9 @@ use crate::ui::{UiMode, draw_checkerboard};
 #[cfg(target_os = "macos")]
 use crate::ui::npc_world::{NpcBlitCallback, NpcBlitResources, NpcWorld};
 
+#[cfg(target_os = "macos")]
+use crate::ui::voxel_overlay::VoxelOverlay;
+
 /// Controls how often the viewport re-renders during training.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderUpdateMode {
@@ -89,6 +92,17 @@ pub struct ScenePanel {
     #[serde(skip)]
     #[cfg(target_os = "macos")]
     npc_world: Option<Arc<Mutex<NpcWorld>>>,
+    /// Debug overlay of the voxel collision surface. `None` if the
+    /// scene didn't ship a `.collision.glb`. Toggled with the `V` key
+    /// at runtime — see `show_voxel_overlay`.
+    #[serde(skip)]
+    #[cfg(target_os = "macos")]
+    voxel_overlay: Option<VoxelOverlay>,
+    /// Current toggle state for [`Self::voxel_overlay`]. Defaults off;
+    /// `V` flips it.
+    #[serde(skip)]
+    #[cfg(target_os = "macos")]
+    show_voxel_overlay: bool,
     #[serde(skip)]
     pub(crate) last_draw: Option<Instant>,
     #[serde(skip)]
@@ -898,6 +912,18 @@ impl AppPane for ScenePanel {
                     cam0.ypr_deg
                 );
             }
+            // Optional debug overlay: the .collision.glb voxel surface
+            // mesh, toggled at runtime with V.
+            if let Some(mesh_path) = scene.voxel_mesh_overlay.as_ref() {
+                match VoxelOverlay::new(state, mesh_path) {
+                    Ok(o) => {
+                        self.voxel_overlay = Some(o);
+                        log::info!("[viewer] voxel overlay loaded — press V to toggle");
+                    }
+                    Err(e) => log::warn!("[viewer] voxel overlay load failed: {e}"),
+                }
+            }
+
             match NpcWorld::new(state, scene) {
                 Ok(world) => {
                     state
@@ -1175,6 +1201,18 @@ impl AppPane for ScenePanel {
                     self.splats_dirty = false;
                 }
 
+                // `V` toggles the voxel collision overlay. Read it
+                // once per paint so a key-down → up cycle counts as
+                // exactly one flip regardless of egui repaint cadence.
+                #[cfg(target_os = "macos")]
+                if ui.input(|i| i.key_pressed(egui::Key::V)) {
+                    self.show_voxel_overlay = !self.show_voxel_overlay;
+                    log::info!(
+                        "[viewer] voxel overlay {}",
+                        if self.show_voxel_overlay { "ON" } else { "OFF" }
+                    );
+                }
+
                 // NPC overlay. Runs physics + animation + mesh render to
                 // an offscreen RGBA8 texture, then a fullscreen-triangle
                 // blit composites it over the splat backbuffer with alpha
@@ -1221,6 +1259,22 @@ impl AppPane for ScenePanel {
                     // Keep the animation ticking even when nothing else
                     // requests a repaint.
                     ui.ctx().request_repaint();
+                }
+
+                // Voxel collision overlay (debug). Same view-projection
+                // helper as the NPC pass so geometry lines up. Semi-
+                // transparent yellow so the splat shows through.
+                #[cfg(target_os = "macos")]
+                if self.show_voxel_overlay
+                    && let Some(overlay) = &self.voxel_overlay
+                {
+                    let aspect = (size.x as f32 / size.y.max(1) as f32).max(0.001);
+                    let view_proj = crate::ui::npc_world::view_projection(
+                        camera.world_to_local(),
+                        camera.fov_y as f32,
+                        aspect,
+                    );
+                    overlay.paint(rect, ui, view_proj, [1.0, 0.9, 0.0, 0.35]);
                 }
 
                 if let Some(grid) = &mut self.grid {
