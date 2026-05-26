@@ -34,6 +34,7 @@ pub struct Cli {
         default_value = "true",
         default_value_if("source", ArgPredicate::IsPresent, "false"),
         default_value_if("render_output", ArgPredicate::IsPresent, "false"),
+        default_value_if("scene", ArgPredicate::IsPresent, "false"),
         help = "Spawn a viewer to visualize the training"
     )]
     pub with_viewer: bool,
@@ -46,14 +47,25 @@ pub struct Cli {
 }
 
 /// Arguments for the headless render-to-PNG mode. Activated by passing
-/// `--render-output`; in that mode the CLI loads the source, renders a
-/// single frame from the configured camera, writes a PNG, and exits.
+/// `--render-output` (single camera) or `--scene` (multi-camera from a
+/// JSON config). In either mode the CLI loads the source, renders, and
+/// exits.
 #[derive(Args, Clone, Debug)]
 pub struct RenderArgs {
-    /// Write a single rendered PNG to this path and exit. Implies
-    /// --with-viewer=false.
+    /// Write a single rendered PNG to this path and exit. Mutually
+    /// exclusive with --scene.
     #[arg(long, value_name = "PATH")]
     pub render_output: Option<PathBuf>,
+
+    /// JSON config with one or more named cameras; renders one PNG per
+    /// camera into --output-dir. Mutually exclusive with --render-output.
+    #[arg(long, value_name = "PATH", conflicts_with = "render_output")]
+    pub scene: Option<PathBuf>,
+
+    /// Output directory for --scene mode. Per-camera files are written
+    /// as `{output_dir}/{camera.name}.png`.
+    #[arg(long, value_name = "DIR", default_value = "./out")]
+    pub output_dir: PathBuf,
 
     /// Camera position in world space, "x,y,z".
     #[arg(long, value_name = "X,Y,Z", default_value = "0,0,-2.5")]
@@ -122,10 +134,12 @@ fn parse_resolution(s: &str) -> Result<glam::UVec2, String> {
 
 impl Cli {
     pub fn validate(self) -> Result<Self, Error> {
-        if self.render.render_output.is_some() && self.source.is_none() {
+        if (self.render.render_output.is_some() || self.render.scene.is_some())
+            && self.source.is_none()
+        {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,
-                "When --render-output is set, --source must be provided",
+                "When --render-output or --scene is set, --source must be provided",
             ));
         }
         if !self.with_viewer && self.source.is_none() {
@@ -136,6 +150,46 @@ impl Cli {
         }
         Ok(self)
     }
+}
+
+/// JSON schema for `--scene PATH`. Defines a set of named cameras the
+/// renderer should produce. Top-level fields are defaults; each camera
+/// can override `resolution` and `fov_y_deg`.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SceneConfig {
+    #[serde(default = "default_resolution")]
+    pub resolution: [u32; 2],
+    #[serde(default = "default_fov_y_deg")]
+    pub fov_y_deg: f64,
+    #[serde(default)]
+    pub background: [f32; 3],
+    pub cameras: Vec<CameraEntry>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CameraEntry {
+    /// Output PNG basename (without extension).
+    pub name: String,
+    /// Camera position in world space.
+    pub pos: [f32; 3],
+    /// Yaw, pitch, roll in degrees. Applied as glam's `EulerRot::YXZ` —
+    /// matches the in-app HUD readout exactly.
+    pub ypr_deg: [f32; 3],
+    /// Override `SceneConfig.resolution` for this camera.
+    #[serde(default)]
+    pub resolution: Option<[u32; 2]>,
+    /// Override `SceneConfig.fov_y_deg` for this camera.
+    #[serde(default)]
+    pub fov_y_deg: Option<f64>,
+}
+
+fn default_resolution() -> [u32; 2] {
+    [1280, 720]
+}
+fn default_fov_y_deg() -> f64 {
+    45.0
 }
 
 /// Run the CLI: pin the trainer stream to a dedicated [`Actor`] thread,
@@ -359,27 +413,19 @@ pub async fn run_cli_ui(
     Ok(())
 }
 
-/// Drive a process to `DoneLoading`, then render a single frame from
-/// the configured camera and write it as a PNG.
+/// Drive a process to `DoneLoading`, then either render a single frame
+/// (`--render-output`) or one frame per camera in `--scene` config.
 pub async fn run_render(
     mut process: RunningProcess,
     args: RenderArgs,
 ) -> Result<(), anyhow::Error> {
-    use brush_render::{TextureMode, gaussian_splats::render_splats};
-    use image::Rgb32FImage;
-
-    let output = args
-        .render_output
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("render_output unset"))?;
-
     log::info!("Loading source...");
     while let Some(msg) = process.stream.next().await {
         match msg? {
             ProcessMessage::DoneLoading => break,
             ProcessMessage::StartLoading { training, .. } if training => {
                 anyhow::bail!(
-                    "--render-output expects a single .ply / .compressed.ply source, not a training dataset"
+                    "render mode expects a single .ply / .compressed.ply source, not a training dataset"
                 );
             }
             ProcessMessage::Warning { error } => {
@@ -394,30 +440,87 @@ pub async fn run_render(
         .latest()
         .ok_or_else(|| anyhow::anyhow!("no splats were loaded from source"))?;
     log::info!(
-        "Loaded {} splats (sh degree {}). Rendering at {}x{}...",
+        "Loaded {} splats (sh degree {}).",
         splats.num_splats(),
         splats.sh_degree(),
-        args.resolution.x,
-        args.resolution.y,
     );
 
-    let camera = build_camera(&args);
-    let img_size = args.resolution;
-    let background = args.background.0;
+    if let Some(scene_path) = args.scene.as_ref() {
+        let raw = tokio::fs::read_to_string(scene_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", scene_path.display()))?;
+        let scene: SceneConfig = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid scene config {}: {e}", scene_path.display()))?;
+        if scene.cameras.is_empty() {
+            anyhow::bail!("scene config has no cameras");
+        }
+        tokio::fs::create_dir_all(&args.output_dir).await?;
+        // All cameras render the same `splats` instance — when an
+        // animated character lands later, each per-frame loop iteration
+        // will bind a single (time, character_pose) and render every
+        // camera against that shared world state in sequence, so the
+        // cameras observe the same scene at the same instant.
+        for entry in &scene.cameras {
+            let img_size = entry
+                .resolution
+                .map(|[w, h]| glam::uvec2(w, h))
+                .unwrap_or_else(|| glam::uvec2(scene.resolution[0], scene.resolution[1]));
+            let fov_y_deg = entry.fov_y_deg.unwrap_or(scene.fov_y_deg);
+            let camera = camera_from_ypr(entry.pos.into(), entry.ypr_deg.into(), fov_y_deg, img_size);
+            let output = args.output_dir.join(format!("{}.png", entry.name));
+            log::info!(
+                "Rendering camera '{}' at {}x{} → {}",
+                entry.name,
+                img_size.x,
+                img_size.y,
+                output.display(),
+            );
+            render_and_save(
+                splats.clone(),
+                &camera,
+                img_size,
+                glam::Vec3::from(scene.background),
+                &output,
+            )
+            .await?;
+        }
+    } else {
+        let output = args
+            .render_output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("expected --render-output or --scene"))?;
+        let camera = build_camera(&args);
+        log::info!(
+            "Rendering at {}x{} → {}",
+            args.resolution.x,
+            args.resolution.y,
+            output.display(),
+        );
+        render_and_save(splats, &camera, args.resolution, args.background.0, output).await?;
+    }
 
-    let (image, _aux) = render_splats(
-        splats,
-        &camera,
-        img_size,
-        background,
-        None,
-        TextureMode::Float,
-    )
-    .await;
+    Ok(())
+}
 
-    // Float-mode output is [h, w, 4] (RGBA); drop alpha to match Rgb32FImage's
-    // 3-channel expectation. Eval does the same: see EvalSample::save_to_disk.
+/// Render `splats` with `camera` at `img_size` against `background` and
+/// write the result as a PNG to `output`. Parent dirs are created as
+/// needed.
+async fn render_and_save(
+    splats: brush_render::gaussian_splats::Splats,
+    camera: &brush_render::camera::Camera,
+    img_size: glam::UVec2,
+    background: glam::Vec3,
+    output: &std::path::Path,
+) -> Result<(), anyhow::Error> {
+    use brush_render::{TextureMode, gaussian_splats::render_splats};
     use burn::tensor::s;
+    use image::Rgb32FImage;
+
+    let (image, _aux) = render_splats(splats, camera, img_size, background, None, TextureMode::Float).await;
+
+    // Float-mode output is [h, w, 4] (RGBA); drop alpha to match
+    // Rgb32FImage's 3-channel expectation. EvalSample::save_to_disk
+    // pre-slices, so a direct port without the slice tiles the image.
     let image = image.slice(s![.., .., 0..3]);
     let [h, w, _] = [image.dims()[0], image.dims()[1], image.dims()[2]];
     let data = image
@@ -437,6 +540,35 @@ pub async fn run_render(
     img.save(output)?;
     log::info!("Saved render to {}", output.display());
     Ok(())
+}
+
+fn camera_from_ypr(
+    pos: glam::Vec3,
+    ypr_deg: glam::Vec3,
+    fov_y_deg: f64,
+    img_size: glam::UVec2,
+) -> brush_render::camera::Camera {
+    use brush_render::camera::Camera;
+    use brush_render::kernels::camera_model::CameraModel;
+    use glam::{EulerRot, Quat};
+
+    let rotation = Quat::from_euler(
+        EulerRot::YXZ,
+        ypr_deg.x.to_radians(),
+        ypr_deg.y.to_radians(),
+        ypr_deg.z.to_radians(),
+    );
+    let aspect = img_size.x as f64 / img_size.y as f64;
+    let fov_y = fov_y_deg.to_radians();
+    let fov_x = 2.0 * ((fov_y / 2.0).tan() * aspect).atan();
+    Camera::new(
+        pos,
+        rotation,
+        fov_x,
+        fov_y,
+        glam::vec2(0.5, 0.5),
+        CameraModel::Pinhole,
+    )
 }
 
 fn build_camera(args: &RenderArgs) -> brush_render::camera::Camera {

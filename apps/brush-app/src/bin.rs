@@ -55,9 +55,9 @@ fn main() -> Result<(), anyhow::Error> {
                 })
             });
 
-            if args.render.render_output.is_some() {
+            if args.render.render_output.is_some() || args.render.scene.is_some() {
                 brush_process::burn_init_setup().await;
-                let process = init_process.expect("Must provide a source for --render-output");
+                let process = init_process.expect("Must provide a source for render mode");
                 brush_cli::run_render(process, args.render).await?;
             } else if args.with_viewer {
                 use crate::ui::app::App;

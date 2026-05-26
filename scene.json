@@ -1,0 +1,17 @@
+{
+  "resolution": [1620, 1000],
+  "fov_y_deg": 45.8,
+  "background": [0.0, 0.0, 0.0],
+  "cameras": [
+    {
+      "name": "cam_warehouse_floor",
+      "pos": [1.41, -2.51, 4.35],
+      "ypr_deg": [150.5, -17.7, 0.0]
+    },
+    {
+      "name": "cam_warehouse_wide",
+      "pos": [1.86, -2.85, -15.11],
+      "ypr_deg": [5.7, -7.3, 0.0]
+    }
+  ]
+}

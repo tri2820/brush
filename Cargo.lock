@@ -999,6 +999,8 @@ dependencies = [
  "indicatif",
  "indicatif-log-bridge",
  "log",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",
