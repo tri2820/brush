@@ -481,6 +481,13 @@ pub async fn run_render(
     process: RunningProcess,
     args: RenderArgs,
 ) -> Result<(), anyhow::Error> {
+    // Same logger bootstrap as run_record so `just screenshot` is not silent.
+    let mut builder = env_logger::Builder::from_default_env();
+    if std::env::var("RUST_LOG").is_err() {
+        builder.filter_level(log::LevelFilter::Info);
+    }
+    let _ = builder.target(env_logger::Target::Stdout).try_init();
+
     let (splats, scene) = load_splats_and_scene(process, &args).await?;
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
@@ -591,11 +598,14 @@ pub async fn run_record(
 
     // run_record is invoked directly from bin.rs without going through the
     // indicatif-flavored logger setup in run_cli_ui, so initialize a plain
-    // env_logger here. Ignore the error if a logger is already installed
-    // (run_render going through the same crate could also init).
-    let _ = env_logger::Builder::from_default_env()
-        .target(env_logger::Target::Stdout)
-        .try_init();
+    // env_logger here. Default to Info level when RUST_LOG isn't set so
+    // `just record` actually shows progress; otherwise the user sees only
+    // a row of macOS finishWriting warnings and wonders if anything ran.
+    let mut builder = env_logger::Builder::from_default_env();
+    if std::env::var("RUST_LOG").is_err() {
+        builder.filter_level(log::LevelFilter::Info);
+    }
+    let _ = builder.target(env_logger::Target::Stdout).try_init();
 
     let total = args
         .record_frames
