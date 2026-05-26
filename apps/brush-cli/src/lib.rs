@@ -112,6 +112,11 @@ pub struct SceneConfig {
     #[serde(default)]
     pub background: [f32; 3],
     pub cameras: Vec<CameraEntry>,
+    /// NPCs placed in the scene. Each renders one glTF character on top
+    /// of the splat output (with optional skeletal animation + scripted
+    /// path in later phases).
+    #[serde(default)]
+    pub npcs: Vec<NpcEntry>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -132,11 +137,41 @@ pub struct CameraEntry {
     pub fov_y_deg: Option<f64>,
 }
 
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct NpcEntry {
+    pub name: String,
+    /// Path to the glTF .glb file.
+    pub asset: PathBuf,
+    /// Static world-space placement (overridden by `path` in later phases).
+    #[serde(default)]
+    pub pos: [f32; 3],
+    /// Yaw degrees around +Y axis. Pitch/roll fixed to 0.
+    #[serde(default)]
+    pub yaw_deg: f32,
+    /// Uniform scale applied to the mesh.
+    #[serde(default = "default_npc_scale")]
+    pub scale: f32,
+    /// Base diffuse color (linear 0..1). Overrides whatever the glTF
+    /// material would say; we don't sample materials yet.
+    #[serde(default = "default_npc_color")]
+    pub color: [f32; 3],
+    /// Optional name of an animation in the glb to play.
+    #[serde(default)]
+    pub animation: Option<String>,
+}
+
 fn default_resolution() -> [u32; 2] {
     [1280, 720]
 }
 fn default_fov_y_deg() -> f64 {
     45.0
+}
+fn default_npc_scale() -> f32 {
+    1.0
+}
+fn default_npc_color() -> [f32; 3] {
+    [0.7, 0.55, 0.45]
 }
 
 /// Run the CLI: pin the trainer stream to a dedicated [`Actor`] thread,
@@ -400,6 +435,7 @@ pub async fn run_record(
     device: wgpu::Device,
     queue: wgpu::Queue,
 ) -> Result<(), anyhow::Error> {
+    use brush_character::{GpuMesh, MeshRenderer, NpcInstance, load_mesh};
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
@@ -413,8 +449,49 @@ pub async fn run_record(
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
 
-    // One Recorder per camera, alive for the whole capture. Each owns
-    // its own AVAssetWriter + IOSurface texture cache + swizzle pipeline.
+    // Load each unique NPC glb just once. Multiple NPCs may share the
+    // same `asset` path; we keep a HashMap so we only upload one GpuMesh
+    // and one MeshAsset per file.
+    let mut mesh_cache: std::collections::HashMap<PathBuf, (brush_character::MeshAsset, GpuMesh)> =
+        std::collections::HashMap::new();
+    for npc in &scene.npcs {
+        if !mesh_cache.contains_key(&npc.asset) {
+            log::info!("Loading character asset {}", npc.asset.display());
+            let asset = load_mesh(&npc.asset)?;
+            let gpu = GpuMesh::upload(&device, &asset);
+            mesh_cache.insert(npc.asset.clone(), (asset, gpu));
+        }
+    }
+
+    // Shared mesh renderer state. One per cli invocation; bind groups
+    // and depth target are owned by MeshRenderer.
+    let mut mesh_renderer = MeshRenderer::new(&device, wgpu::TextureFormat::Bgra8Unorm);
+
+    // Per-NPC GPU instance: model matrix uniform + skin matrices
+    // storage. T-pose for now; phase 3 swaps the skin matrices each
+    // frame from the animation evaluator.
+    let mut npc_instances: Vec<(usize, NpcInstance)> = Vec::with_capacity(scene.npcs.len());
+    for (i, npc) in scene.npcs.iter().enumerate() {
+        let (_asset, gpu) = mesh_cache.get(&npc.asset).expect("just inserted");
+        // The supersplat warehouse scene uses Y-DOWN world coords (see
+        // earlier camera calibration: yaw/pitch derived assuming +Y is
+        // down). The Meshy/Mixamo character is Y-UP. Flip it via a
+        // 180° rotation around X so its head points to world -Y.
+        // yaw_deg rotates around the world's "up" (= -Y in this scene),
+        // which after the X-flip is the character's own +Y axis;
+        // applying it on the OUTSIDE keeps yaw_deg behaving like a
+        // normal heading.
+        let rot = glam::Quat::from_rotation_y(npc.yaw_deg.to_radians())
+            * glam::Quat::from_rotation_x(std::f32::consts::PI);
+        let model = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(npc.scale),
+            rot,
+            glam::Vec3::from(npc.pos),
+        );
+        let inst = mesh_renderer.make_instance(&device, gpu, model, npc.color);
+        npc_instances.push((i, inst));
+    }
+
     struct Cam {
         entry: CameraEntry,
         img_size: glam::UVec2,
@@ -452,18 +529,17 @@ pub async fn run_record(
     }
 
     log::info!(
-        "Recording {} frames at {} fps across {} cameras...",
+        "Recording {} frames at {} fps across {} cameras + {} NPCs...",
         total,
         args.record_fps,
         cams.len(),
+        scene.npcs.len(),
     );
 
     let t_start = std::time::Instant::now();
     for _frame in 0..total {
-        // Single world-state advance per frame would go here once
-        // there's animated content (character pose, time-varying
-        // lights, etc.). For now the scene is static; every camera
-        // sees the same Splats this iteration.
+        // World state advances here when there's animation. For phase
+        // 2 NPCs are static (T-pose at their declared positions).
         for cam in &mut cams {
             let camera = camera_from_ypr(
                 cam.entry.pos.into(),
@@ -471,6 +547,8 @@ pub async fn run_record(
                 cam.fov_y_deg,
                 cam.img_size,
             );
+
+            // (1) Brush splat raster → wgpu::Buffer (packed RGBA8 u32)
             let (tensor, _aux) = render_splats(
                 splats.clone(),
                 &camera,
@@ -485,12 +563,53 @@ pub async fn run_record(
                 .client
                 .get_resource(cube.handle.clone())
                 .map_err(|e| anyhow::anyhow!("get_resource failed: {e:?}"))?;
-            // Fence brush's submission before the swizzle reads the
-            // buffer — otherwise the shader sees the buffer's initial
-            // (zero) state.
+            // Fence brush's submission before the swizzle reads.
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             let res = resource.resource();
-            cam.recorder.write_frame(&res.buffer, res.offset)?;
+
+            // (2) Open the frame, swizzle splats into the IOSurface as
+            // the backdrop, then run the mesh pass on top.
+            let mut frame = cam.recorder.begin_frame()?;
+            frame.swizzle_from(&res.buffer, res.offset);
+
+            if !npc_instances.is_empty() {
+                // Recompute view-projection in the convention the mesh
+                // shader uses. brush's renderer uses +Z forward; for
+                // wgpu clip space we go through `Mat4::perspective_rh`
+                // with the same fov_y and aspect.
+                let aspect = cam.img_size.x as f32 / cam.img_size.y as f32;
+                let proj = glam::Mat4::perspective_rh(
+                    cam.fov_y_deg.to_radians() as f32,
+                    aspect,
+                    0.05,
+                    1000.0,
+                );
+                let view = glam::Mat4::from(camera.world_to_local());
+                let view_brush_to_wgpu =
+                    glam::Mat4::from_quat(glam::Quat::from_rotation_x(std::f32::consts::PI));
+                let view_proj = proj * view_brush_to_wgpu * view;
+                let cam_pos = camera.position;
+
+                mesh_renderer.set_camera(&queue, view_proj, cam_pos);
+                let draws: Vec<_> = npc_instances
+                    .iter()
+                    .map(|(i, inst)| {
+                        let asset_path = &scene.npcs[*i].asset;
+                        (
+                            &mesh_cache
+                                .get(asset_path)
+                                .expect("preloaded")
+                                .1,
+                            inst,
+                        )
+                    })
+                    .collect();
+                let mesh_submission =
+                    mesh_renderer.render(&device, &queue, frame.color_texture(), draws);
+                frame.note_submission(mesh_submission);
+            }
+
+            frame.finish()?;
         }
     }
 

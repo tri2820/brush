@@ -17,6 +17,7 @@ wgpu.workspace = true
 indicatif.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+brush-character.path = "../../crates/brush-character"
 brush-record.path = "../../crates/brush-record"
 indicatif-log-bridge = "0.2"
 clap.workspace = true

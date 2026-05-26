@@ -28,22 +28,29 @@ impl IoSurfaceTextureCache {
         }
     }
 
-    pub fn texture_for(
+    /// Look up (or create) the wgpu texture for the given pixel buffer's
+    /// IOSurface. Returns the surface ID, which the caller can later pass
+    /// to [`Self::texture_by_key`] to retrieve the same texture without
+    /// re-borrowing `self` mutably.
+    pub fn ensure_texture(
         &mut self,
         device: &wgpu::Device,
         pixel_buf: &CVPixelBuffer,
         width: u32,
         height: u32,
-    ) -> Result<&wgpu::Texture> {
+    ) -> Result<u32> {
         let surface = CVPixelBufferGetIOSurface(Some(pixel_buf))
             .ok_or_else(|| anyhow!("CVPixelBuffer is not IOSurface-backed"))?;
         let surface_id = IOSurfaceRef::id(&surface);
-
         if !self.by_surface_id.contains_key(&surface_id) {
             let texture = create_wgpu_texture_from_iosurface(device, &surface, width, height)?;
             self.by_surface_id.insert(surface_id, texture);
         }
-        Ok(self.by_surface_id.get(&surface_id).expect("just inserted"))
+        Ok(surface_id)
+    }
+
+    pub fn texture_by_key(&self, key: u32) -> Option<&wgpu::Texture> {
+        self.by_surface_id.get(&key)
     }
 }
 
@@ -66,7 +73,12 @@ fn create_wgpu_texture_from_iosurface(
             false,
         )
     };
-    descriptor.setUsage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+    // ShaderWrite for the swizzle compute pass; RenderTarget so the
+    // brush-character mesh pipeline can use this same IOSurface as a
+    // color attachment (LoadOp::Load preserves the splat backdrop).
+    descriptor.setUsage(
+        MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
+    );
     descriptor.setStorageMode(MTLStorageMode::Shared);
 
     // Reach into wgpu's Metal HAL to (a) call newTextureWithDescriptor:
@@ -116,7 +128,9 @@ fn create_wgpu_texture_from_iosurface(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     };
     let texture =
