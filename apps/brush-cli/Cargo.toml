@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 brush-async.path = "../../crates/brush-async"
 brush-process.path = "../../crates/brush-process"
+brush-render.path = "../../crates/brush-render"
 
+burn.workspace = true
 indicatif.workspace = true
 indicatif-log-bridge = "0.2"
 clap.workspace = true
@@ -19,6 +21,8 @@ humantime.workspace = true
 log.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
+glam.workspace = true
+image.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }

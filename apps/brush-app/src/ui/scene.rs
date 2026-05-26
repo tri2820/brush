@@ -266,6 +266,53 @@ impl ScenePanel {
         }
     }
 
+    fn draw_camera_overlay(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        camera: &brush_render::camera::Camera,
+    ) {
+        let id = ui.auto_id_with("camera_overlay");
+        let pos = camera.position;
+        // YXZ matches a typical yaw (around up) → pitch (around right) → roll (around forward)
+        // readout for a fly-cam. glam's Quat::to_euler returns radians.
+        let (yaw, pitch, roll) = camera.rotation.to_euler(glam::EulerRot::YXZ);
+        let fov_x_deg = camera.fov_x.to_degrees();
+        let fov_y_deg = camera.fov_y.to_degrees();
+
+        egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.min.x + 6.0, rect.min.y + 6.0))
+            .show(ui.ctx(), |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(0, 0, 0, 140))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        let line = |s: String| {
+                            RichText::new(s)
+                                .monospace()
+                                .size(11.0)
+                                .color(Color32::from_rgb(220, 220, 220))
+                        };
+                        ui.label(line(format!(
+                            "pos  {:>8.2} {:>8.2} {:>8.2}",
+                            pos.x, pos.y, pos.z
+                        )));
+                        ui.label(line(format!(
+                            "yaw {:>6.1}°  pitch {:>6.1}°  roll {:>6.1}°",
+                            yaw.to_degrees(),
+                            pitch.to_degrees(),
+                            roll.to_degrees(),
+                        )));
+                        ui.label(line(format!(
+                            "fov  x {:>5.1}°  y {:>5.1}°",
+                            fov_x_deg, fov_y_deg
+                        )));
+                    });
+            });
+    }
+
     fn draw_warnings_popup(&mut self, ui: &mut egui::Ui, popup_id: egui::Id) {
         ui.set_min_width(280.0);
         ui.set_max_width(400.0);
@@ -1084,6 +1131,7 @@ impl AppPane for ScenePanel {
             if interactive {
                 self.draw_play_pause(ui, rect);
             }
+            self.draw_camera_overlay(ui, rect, &camera);
         }
 
         // Draw settings popup if loading (at end so it draws over everything)
