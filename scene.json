@@ -25,7 +25,7 @@
         "type": "linear",
         "start": [6.0, -0.99, 0.21],
         "end": [1.0, -0.99, 0.21],
-        "duration_s": 4.0
+        "duration_s": 8.0
       }
     },
     {
@@ -38,7 +38,7 @@
         "type": "linear",
         "start": [1.0, -0.99, 1.5],
         "end": [6.0, -0.99, 1.5],
-        "duration_s": 4.0
+        "duration_s": 8.0
       }
     }
   ]
