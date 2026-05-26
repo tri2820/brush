@@ -13,6 +13,11 @@ use crate::shaders::helpers::ProjectUniforms;
 #[derive(Debug, Clone)]
 pub struct RenderOutput<B: Backend> {
     pub out_img: FloatTensor<B>,
+    /// Per-pixel view-space linear depth from the rasterizer
+    /// (camera-local +Z forward; far-plane sentinel `1e30` for pixels
+    /// with no contributing splat). Used by the host to depth-test
+    /// meshes against the splat surface.
+    pub depth_img: FloatTensor<B>,
     pub aux: RenderAuxInner<B>,
     // State needed by the backward pass; non-diff callers can ignore these.
     pub projected_splats: FloatTensor<B>,
@@ -74,6 +79,8 @@ pub struct RenderAux {
     pub max_radius: Tensor<1>,
     pub tile_offsets: Tensor<3, Int>,
     pub img_size: glam::UVec2,
+    /// Per-pixel view-space depth [h, w] (camera-local +Z forward).
+    pub depth_img: Tensor<2>,
 }
 
 impl RenderAux {

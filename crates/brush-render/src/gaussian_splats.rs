@@ -342,6 +342,7 @@ pub async fn render_splats(
         max_radius: wrap_wgpu_float(output.aux.max_radius),
         tile_offsets: wrap_wgpu_int(output.aux.tile_offsets),
         img_size,
+        depth_img: wrap_wgpu_float(output.depth_img),
     };
 
     (wrap_wgpu_float(output.out_img), aux)

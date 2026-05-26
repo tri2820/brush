@@ -21,6 +21,13 @@ use super::helpers::{
 };
 use super::types::{RasterizeUniforms, Sym2};
 
+// `depth_out`: per-pixel view-space depth (camera-local +Z forward)
+// used for splat-vs-mesh occlusion. We track the depth of the first
+// splat whose contribution drops the front-to-back transmittance
+// `t_acc` below 0.5 — the "median surface" — and fall back to the
+// last contributing splat's depth if `t_acc` never reached that
+// threshold (sky / transparent regions). Pixels with no contributing
+// splat at all stay at the kernel's `1e30` far-plane sentinel.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn rasterize_kernel(
@@ -29,6 +36,7 @@ pub fn rasterize_kernel(
     projected: &Tensor<f32>,
     out_img_packed: &mut Tensor<u32>,
     out_img_f32: &mut Tensor<f32>,
+    depth_out: &mut Tensor<f32>,
     global_from_compact_gid: &Tensor<u32>,
     visible: &mut Tensor<f32>,
     u: RasterizeUniforms,
@@ -77,6 +85,16 @@ pub fn rasterize_kernel(
     let mut pix_b = 0.0f32;
     let mut done = !inside;
     let mut last_useful_isect = range_lo;
+
+    // Depth tracking for splat-vs-mesh occlusion.
+    // `pix_depth` = depth of the first splat that pushes accumulated
+    // transmittance below 0.5 (the "median surface"). `last_depth` is
+    // the depth of the most recent contributing splat — used as a
+    // fallback when no splat in the pixel ever crosses the half-α
+    // threshold (e.g. semi-transparent regions).
+    let mut pix_depth = 1.0e30f32; // sentinel: far-plane
+    let mut last_depth = 1.0e30f32;
+    let mut depth_set = false;
 
     if done {
         Atomic::fetch_add(&num_done_atomic[0], 1u32);
@@ -145,6 +163,18 @@ pub fn rasterize_kernel(
                     pix_r += max(local_batch[dst_base + 6], 0.0f32) * vis;
                     pix_g += max(local_batch[dst_base + 7], 0.0f32) * vis;
                     pix_b += max(local_batch[dst_base + 8], 0.0f32) * vis;
+                    // Depth: read view-space z lane and update the
+                    // surface estimate. First time we cross t_acc
+                    // through 0.5 wins (front-to-back order means this
+                    // splat is the closest "median surface"). Always
+                    // remember the last contributing splat's depth in
+                    // case we never cross 0.5.
+                    let splat_depth = local_batch[dst_base + 9];
+                    last_depth = splat_depth;
+                    if !depth_set && next_t < 0.5f32 {
+                        pix_depth = splat_depth;
+                        depth_set = true;
+                    }
                     t_acc = next_t;
                     last_useful_isect = batch_start + t + 1u32;
                 }
@@ -162,6 +192,11 @@ pub fn rasterize_kernel(
         let final_g = pix_g + t_acc * u.bg_g;
         let final_b = pix_b + t_acc * u.bg_b;
         let final_a = 1.0f32 - t_acc;
+        // Surface depth: if we never crossed α=0.5, fall back to the
+        // last contributing splat; if no splat contributed at all,
+        // keep the far-plane sentinel from `pix_depth`'s initial.
+        let depth_pick = if !depth_set { last_depth } else { pix_depth };
+        depth_out[pix_id as usize] = depth_pick;
         if comptime![bwd_info] {
             let base = (pix_id * 4u32) as usize;
             out_img_f32[base] = final_r;

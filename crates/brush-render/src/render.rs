@@ -264,6 +264,16 @@ impl SplatOps<Self> for MainBackendBase {
             // Using `float_zeros` makes that read a well-defined no-op.
             Self::float_zeros([1].into(), &device, FloatDType::F32)
         };
+        // Per-pixel view-space depth from the rasterizer. We zero-init
+        // first (pixels with no contributing splat will be overwritten
+        // to the kernel's far-plane sentinel anyway). Used by the
+        // host-side mesh pipeline to depth-test characters against
+        // splat geometry.
+        let depth_img = Self::float_zeros(
+            [img_size.y as usize, img_size.x as usize].into(),
+            &device,
+            FloatDType::F32,
+        );
         tracing::trace_span!("Rasterize").in_scope(|| {
             let uniforms = RasterizeUniformsLaunch::new(
                 project_uniforms.tile_bounds[0],
@@ -285,6 +295,7 @@ impl SplatOps<Self> for MainBackendBase {
                 projected_splats.clone().into_tensor_arg(),
                 out_packed_arg.into_tensor_arg(),
                 out_f32_arg.into_tensor_arg(),
+                depth_img.clone().into_tensor_arg(),
                 global_from_compact_gid.clone().into_tensor_arg(),
                 visible.clone().into_tensor_arg(),
                 uniforms,
@@ -294,6 +305,7 @@ impl SplatOps<Self> for MainBackendBase {
         });
         RenderOutput {
             out_img,
+            depth_img,
             aux: RenderAuxInner {
                 num_visible,
                 num_intersections,

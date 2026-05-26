@@ -13,11 +13,13 @@
 //! - [`Path`] — produces (position, heading) at time `t` for a single
 //!   NPC, driving the per-instance transform.
 
+mod depth_fill;
 mod gltf_load;
 mod mesh_render;
 mod path;
 mod skeleton;
 
+pub use depth_fill::DepthFill;
 pub use gltf_load::{
     Animation, JointChannel, Material, MeshAsset, Skeleton, TextureImage, Track, load_mesh,
 };

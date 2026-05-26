@@ -165,6 +165,10 @@ pub struct MeshRenderer {
     /// 1×1 flat normal map (128, 128, 255) interpreted as tangent-space
     /// (0, 0, 1) — i.e. no perturbation.
     fallback_normal: wgpu::Texture,
+    depth_fill: crate::depth_fill::DepthFill,
+    /// `fill_depth_from_splats` sets this; `render` consumes it. Used
+    /// to pick `LoadOp::Load` vs `LoadOp::Clear` on the depth target.
+    last_depth_filled: bool,
 }
 
 impl MeshRenderer {
@@ -379,6 +383,8 @@ impl MeshRenderer {
             [128, 128, 255, 255],
         );
 
+        let depth_fill = crate::depth_fill::DepthFill::new(device);
+
         Self {
             pipeline,
             instance_bgl,
@@ -388,6 +394,8 @@ impl MeshRenderer {
             depth_size: (0, 0),
             fallback_base_color,
             fallback_normal,
+            depth_fill,
+            last_depth_filled: false,
         }
     }
 
@@ -553,10 +561,43 @@ impl MeshRenderer {
         }
     }
 
+    /// Optional pre-pass that seeds the mesh pass's depth target from
+    /// brush's per-pixel linear depth tensor. Call **before** `render`
+    /// each frame when you want NPCs depth-tested against splat
+    /// geometry; skip it and the mesh pass clears depth to 1.0 instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_depth_from_splats(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_texture: &wgpu::Texture,
+        splat_depth_buffer: &wgpu::Buffer,
+        splat_depth_offset: u64,
+        near: f32,
+        far: f32,
+    ) -> wgpu::SubmissionIndex {
+        let (w, h) = (color_texture.width(), color_texture.height());
+        self.ensure_depth(device, w, h);
+        self.last_depth_filled = true;
+        self.depth_fill.dispatch(
+            device,
+            queue,
+            splat_depth_buffer,
+            splat_depth_offset,
+            w,
+            h,
+            near,
+            far,
+            self.depth_view.as_ref().expect("ensure_depth"),
+        )
+    }
+
     /// Run one render pass into `color_view` (the IOSurface texture
     /// view) drawing the given instances. Returns the submission index
     /// the caller should fence on before the encoder reads the
-    /// IOSurface.
+    /// IOSurface. If `fill_depth_from_splats` was called this frame
+    /// the depth attachment is loaded (NPCs occluded by splats);
+    /// otherwise we clear to 1.0.
     pub fn render<'a>(
         &mut self,
         device: &wgpu::Device,
@@ -567,6 +608,15 @@ impl MeshRenderer {
         let (w, h) = (color_texture.width(), color_texture.height());
         self.ensure_depth(device, w, h);
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let depth_load = if self.last_depth_filled {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(1.0)
+        };
+        // Reset for next frame; the caller must call
+        // `fill_depth_from_splats` again to opt back in.
+        self.last_depth_filled = false;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("character mesh pass"),
@@ -587,7 +637,7 @@ impl MeshRenderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.depth_view.as_ref().expect("ensure_depth"),
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: depth_load,
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,

@@ -83,6 +83,10 @@ pub fn project_visible_kernel(
             color_r: cr_c,
             color_g: cg_c,
             color_b: cb_c,
+            // View-space Z (positive forward in brush's convention)
+            // is what the rasterizer needs to emit per-pixel depth for
+            // splat-vs-mesh occlusion.
+            depth: mean_c.z(),
         },
     );
 }

@@ -213,6 +213,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
         struct BindOp {
             desc: CustomOpIr,
             out_img: FloatTensor<MainBackendBase>,
+            depth_img: FloatTensor<MainBackendBase>,
             visible: FloatTensor<MainBackendBase>,
             max_radius: FloatTensor<MainBackendBase>,
             projected_splats: FloatTensor<MainBackendBase>,
@@ -226,9 +227,10 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
                 &self,
                 h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>,
             ) {
-                let (_, outputs) = self.desc.as_fixed::<0, 7>();
+                let (_, outputs) = self.desc.as_fixed::<0, 8>();
                 let [
                     out_img,
+                    depth_img,
                     visible,
                     max_radius,
                     projected_splats,
@@ -238,6 +240,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
                 ] = outputs;
 
                 h.register_float_tensor::<MainBackendBase>(&out_img.id, self.out_img.clone());
+                h.register_float_tensor::<MainBackendBase>(&depth_img.id, self.depth_img.clone());
                 h.register_float_tensor::<MainBackendBase>(&visible.id, self.visible.clone());
                 h.register_float_tensor::<MainBackendBase>(&max_radius.id, self.max_radius.clone());
                 h.register_float_tensor::<MainBackendBase>(
@@ -262,6 +265,11 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
         let out_img_ir = TensorIr::uninit(
             client.create_empty_handle(),
             out.out_img.shape(),
+            DType::F32,
+        );
+        let depth_img_ir = TensorIr::uninit(
+            client.create_empty_handle(),
+            out.depth_img.shape(),
             DType::F32,
         );
         let visible_ir = TensorIr::uninit(
@@ -301,6 +309,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
             &[],
             &[
                 out_img_ir,
+                depth_img_ir,
                 visible_ir,
                 max_radius_ir,
                 projected_splats_ir,
@@ -312,6 +321,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
         let op = BindOp {
             desc: desc.clone(),
             out_img: out.out_img,
+            depth_img: out.depth_img,
             visible: out.aux.visible,
             max_radius: out.aux.max_radius,
             projected_splats: out.projected_splats,
@@ -326,6 +336,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
 
         let [
             out_img,
+            depth_img,
             visible,
             max_radius,
             projected_splats,
@@ -336,6 +347,7 @@ impl SplatOps<Self> for Fusion<MainBackendBase> {
 
         RenderOutput {
             out_img,
+            depth_img,
             aux: RenderAuxInner {
                 num_visible: out.aux.num_visible,
                 num_intersections: out.aux.num_intersections,

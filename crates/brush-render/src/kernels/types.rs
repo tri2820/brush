@@ -26,6 +26,11 @@ pub struct Splat {
     pub color_r: f32,
     pub color_g: f32,
     pub color_b: f32,
+    /// View-space depth (camera-local z, positive for points in front
+    /// of the camera in brush's +Z-forward convention). Populated by
+    /// `project_visible` and consumed by the rasterizer to emit the
+    /// per-pixel depth buffer used for splat-vs-mesh occlusion.
+    pub depth: f32,
 }
 
 #[cube]
@@ -41,6 +46,7 @@ impl Splat {
             color_r: 0.0f32,
             color_g: 0.0f32,
             color_b: 0.0f32,
+            depth: 0.0f32,
         }
     }
 }

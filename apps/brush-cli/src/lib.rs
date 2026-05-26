@@ -117,6 +117,14 @@ pub struct SceneConfig {
     /// path in later phases).
     #[serde(default)]
     pub npcs: Vec<NpcEntry>,
+    /// Optional voxel-octree collision asset (.voxel.json). When set,
+    /// NPCs with a `path` are snapped to the floor each frame: their Y
+    /// is overridden with `floor_y(x, z) + feet_offset`, where
+    /// `feet_offset` is captured once at startup from the authored
+    /// start Y so the original visual offset (model origin to feet) is
+    /// preserved across the path.
+    #[serde(default)]
+    pub collision: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -526,10 +534,19 @@ pub async fn run_record(
     queue: wgpu::Queue,
 ) -> Result<(), anyhow::Error> {
     use brush_character::{GpuMaterial, GpuMesh, MeshRenderer, NpcInstance, load_mesh};
+    use brush_collision::VoxelCollision;
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
     use burn::tensor::s;
+
+    // run_record is invoked directly from bin.rs without going through the
+    // indicatif-flavored logger setup in run_cli_ui, so initialize a plain
+    // env_logger here. Ignore the error if a logger is already installed
+    // (run_render going through the same crate could also init).
+    let _ = env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stdout)
+        .try_init();
 
     let total = args
         .record_frames
@@ -539,6 +556,16 @@ pub async fn run_record(
     let (splats, scene) = load_splats_and_scene(process, &args).await?;
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
+
+    // Optional voxel collision for floor snapping. Loaded once; queried per
+    // NPC per frame in the inner loop.
+    let collision = match &scene.collision {
+        Some(path) => {
+            log::info!("Loading voxel collision: {}", path.display());
+            Some(VoxelCollision::load(path)?)
+        }
+        None => None,
+    };
 
     // Pull splat positions + degree-0 SH coefficients off the GPU so
     // we can build per-NPC ambient probes on the CPU. One-shot at
@@ -618,6 +645,12 @@ pub async fn run_record(
         instance: NpcInstance,
         animation_index: Option<usize>,
         path: Option<Box<dyn brush_character::Path>>,
+        /// Captured at init: `authored_y - floor_y_at_authored_xz`. When the
+        /// floor snap fires each frame we add this back so the original
+        /// visual offset (model origin to feet) is preserved. `None` means
+        /// the snap is disabled for this NPC — either there's no collision
+        /// asset, or the authored start was outside the voxel grid.
+        feet_offset_y: Option<f32>,
     }
     let mut npc_runtime: Vec<NpcRuntime> = Vec::with_capacity(scene.npcs.len());
     for (i, npc) in scene.npcs.iter().enumerate() {
@@ -686,11 +719,35 @@ pub async fn run_record(
             })),
             None => None,
         };
+        // Capture the floor offset at the authored start. Cast +Y (down,
+        // since this scene is Y-DOWN — see the X-flip comment above) from
+        // well above the grid; the hit's Y is the floor, and the difference
+        // from the authored Y is the constant offset we keep applied as the
+        // NPC walks.
+        let feet_offset_y = collision.as_ref().and_then(|c| {
+            let start = match &npc.path {
+                Some(PathConfig::Linear { start, .. }) => glam::Vec3::from(*start),
+                None => glam::Vec3::from(npc.pos),
+            };
+            let origin = glam::vec3(start.x, c.grid_min().y - 0.1, start.z);
+            let max_dist = c.grid_size().y + 1.0;
+            let hit = c.ray_cast(origin, glam::Vec3::Y, max_dist)?;
+            let offset = start.y - hit.pos.y;
+            log::info!(
+                "npc '{}' floor snap: authored_y={:.3}, floor_y={:.3}, offset={:.3}",
+                npc.name,
+                start.y,
+                hit.pos.y,
+                offset
+            );
+            Some(offset)
+        });
         npc_runtime.push(NpcRuntime {
             scene_index: i,
             instance,
             animation_index,
             path,
+            feet_offset_y,
         });
     }
 
@@ -751,7 +808,15 @@ pub async fn run_record(
             // present, otherwise keep the static (pos, yaw_deg) from
             // scene.json.
             if let Some(path) = rt.path.as_deref() {
-                let pos = path.position(world_t);
+                let mut pos = path.position(world_t);
+                if let (Some(c), Some(off)) = (collision.as_ref(), rt.feet_offset_y) {
+                    let origin = glam::vec3(pos.x, c.grid_min().y - 0.1, pos.z);
+                    if let Some(hit) =
+                        c.ray_cast(origin, glam::Vec3::Y, c.grid_size().y + 1.0)
+                    {
+                        pos.y = hit.pos.y + off;
+                    }
+                }
                 let yaw_deg = path.heading_deg(world_t);
                 let rot = glam::Quat::from_rotation_y(yaw_deg.to_radians())
                     * glam::Quat::from_rotation_x(std::f32::consts::PI);
@@ -777,7 +842,9 @@ pub async fn run_record(
             );
 
             // (1) Brush splat raster → wgpu::Buffer (packed RGBA8 u32)
-            let (tensor, _aux) = render_splats(
+            // plus a per-pixel view-space depth tensor used to
+            // depth-test the NPC mesh against splat geometry.
+            let (tensor, aux) = render_splats(
                 splats.clone(),
                 &camera,
                 cam.img_size,
@@ -786,14 +853,23 @@ pub async fn run_record(
                 TextureMode::Packed,
             )
             .await;
-            let cube = resolve_to_cube_float(tensor);
-            let resource = cube
+            // Color buffer.
+            let cube_color = resolve_to_cube_float(tensor);
+            let resource_color = cube_color
                 .client
-                .get_resource(cube.handle.clone())
-                .map_err(|e| anyhow::anyhow!("get_resource failed: {e:?}"))?;
-            // Fence brush's submission before the swizzle reads.
+                .get_resource(cube_color.handle.clone())
+                .map_err(|e| anyhow::anyhow!("get_resource (color) failed: {e:?}"))?;
+            // Depth buffer.
+            let cube_depth = resolve_to_cube_float(aux.depth_img);
+            let resource_depth = cube_depth
+                .client
+                .get_resource(cube_depth.handle.clone())
+                .map_err(|e| anyhow::anyhow!("get_resource (depth) failed: {e:?}"))?;
+            // Fence brush's submission before either is read by our
+            // downstream passes.
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            let res = resource.resource();
+            let res = resource_color.resource();
+            let depth_res = resource_depth.resource();
 
             // (2) Open the frame, swizzle splats into the IOSurface as
             // the backdrop, then run the mesh pass on top.
@@ -819,6 +895,19 @@ pub async fn run_record(
                 let cam_pos = camera.position;
 
                 mesh_renderer.set_camera(&queue, view_proj, cam_pos);
+                // Splat depth → NDC depth into the mesh pass's depth
+                // attachment. Same `near`/`far` we used in the
+                // projection above; mismatch would shift hardware
+                // depth tests off the actual splat surface.
+                mesh_renderer.fill_depth_from_splats(
+                    &device,
+                    &queue,
+                    frame.color_texture(),
+                    &depth_res.buffer,
+                    depth_res.offset,
+                    0.05,
+                    1000.0,
+                );
                 let draws: Vec<_> = npc_runtime
                     .iter()
                     .map(|rt| {
