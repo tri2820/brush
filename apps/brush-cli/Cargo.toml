@@ -20,6 +20,8 @@ indicatif.workspace = true
 brush-character.path = "../../crates/brush-character"
 brush-collision.path = "../../crates/brush-collision"
 brush-record.path = "../../crates/brush-record"
+bytemuck = { workspace = true, features = ["derive"] }
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
 indicatif-log-bridge = "0.2"
 clap.workspace = true
 tracing.workspace = true

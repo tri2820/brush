@@ -4,6 +4,9 @@
 #[cfg(target_os = "macos")]
 pub mod npc_system;
 
+#[cfg(target_os = "macos")]
+pub mod voxel_overlay_record;
+
 use brush_async::Actor;
 use brush_process::DataSource;
 use brush_process::RunningProcess;
@@ -601,6 +604,7 @@ pub async fn run_record(
     queue: wgpu::Queue,
 ) -> Result<(), anyhow::Error> {
     use crate::npc_system::NpcSystem;
+    use crate::voxel_overlay_record::VoxelOverlay;
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
@@ -678,6 +682,18 @@ pub async fn run_record(
             None => [[0.5, 0.5, 0.5]; 6],
         },
     )?;
+
+    // Voxel collision overlay — same data the viewer's V toggle uses.
+    // Renders on top of the mesh pass per frame so `just snapshot`
+    // produces frames that match the viewer-with-V-on view.
+    let voxel_overlay = match scene.voxel_mesh_overlay.as_ref() {
+        Some(path) => Some(VoxelOverlay::new(
+            &device,
+            wgpu::TextureFormat::Bgra8Unorm,
+            path,
+        )?),
+        None => None,
+    };
 
     struct Cam {
         entry: CameraEntry,
@@ -800,6 +816,26 @@ pub async fn run_record(
                 let mesh_submission =
                     npc_system.render_npcs(&device, &queue, frame.color_texture(), None);
                 frame.note_submission(mesh_submission);
+            }
+
+            // Voxel collision overlay (matches the viewer's V toggle).
+            // Drawn after the mesh pass so it sits visibly on top —
+            // the whole point is to compare against the splat.
+            if let Some(ov) = voxel_overlay.as_ref() {
+                let aspect = cam.img_size.x as f32 / cam.img_size.y as f32;
+                let view_proj = crate::npc_system::view_projection(
+                    camera.world_to_local(),
+                    cam.fov_y_deg.to_radians() as f32,
+                    aspect,
+                );
+                let sub = ov.render(
+                    &device,
+                    &queue,
+                    frame.color_texture(),
+                    view_proj,
+                    [1.0, 0.9, 0.0, 0.35],
+                );
+                frame.note_submission(sub);
             }
 
             frame.finish()?;
