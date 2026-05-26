@@ -93,6 +93,12 @@ struct InstanceUniforms {
     model: [[f32; 4]; 4],
     base_color: [f32; 3],
     _pad: f32,
+    /// 6-tap ambient cube (+X, -X, +Y, -Y, +Z, -Z), in linear color
+    /// space. Sampled from the splat scene near the NPC's anchor
+    /// position; gives the character a directional color cast that
+    /// matches the surrounding scene. Each vec3 is padded to vec4 for
+    /// uniform-layout alignment.
+    ambient_cube: [[f32; 4]; 6],
 }
 
 /// Per-NPC GPU state: model uniform + skin-matrix storage buffer. One
@@ -100,11 +106,23 @@ struct InstanceUniforms {
 pub struct NpcInstance {
     pub model: Mat4,
     pub base_color: [f32; 3],
+    pub ambient_cube: [[f32; 3]; 6],
     instance_buf: wgpu::Buffer,
     skin_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// `joint_count` mat4's worth of bytes; cached here for upload_skin.
     skin_buf_size: u64,
+}
+
+fn pad_cube(c: [[f32; 3]; 6]) -> [[f32; 4]; 6] {
+    [
+        [c[0][0], c[0][1], c[0][2], 0.0],
+        [c[1][0], c[1][1], c[1][2], 0.0],
+        [c[2][0], c[2][1], c[2][2], 0.0],
+        [c[3][0], c[3][1], c[3][2], 0.0],
+        [c[4][0], c[4][1], c[4][2], 0.0],
+        [c[5][0], c[5][1], c[5][2], 0.0],
+    ]
 }
 
 /// Per-mesh material textures + sampler, in their own bind group so
@@ -478,11 +496,13 @@ impl MeshRenderer {
         mesh: &GpuMesh,
         model: Mat4,
         base_color: [f32; 3],
+        ambient_cube: [[f32; 3]; 6],
     ) -> NpcInstance {
         let instance_u = InstanceUniforms {
             model: model.to_cols_array_2d(),
             base_color,
             _pad: 0.0,
+            ambient_cube: pad_cube(ambient_cube),
         };
         let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("character instance ub"),
@@ -525,6 +545,7 @@ impl MeshRenderer {
         NpcInstance {
             model,
             base_color,
+            ambient_cube,
             instance_buf,
             skin_buf,
             bind_group,
@@ -611,13 +632,21 @@ impl MeshRenderer {
 
 impl NpcInstance {
     /// Update the per-instance model matrix uniform.
-    pub fn set_model(&mut self, queue: &wgpu::Queue, model: Mat4, base_color: [f32; 3]) {
+    pub fn set_model(
+        &mut self,
+        queue: &wgpu::Queue,
+        model: Mat4,
+        base_color: [f32; 3],
+        ambient_cube: [[f32; 3]; 6],
+    ) {
         self.model = model;
         self.base_color = base_color;
+        self.ambient_cube = ambient_cube;
         let u = InstanceUniforms {
             model: model.to_cols_array_2d(),
             base_color,
             _pad: 0.0,
+            ambient_cube: pad_cube(ambient_cube),
         };
         queue.write_buffer(&self.instance_buf, 0, bytemuck::bytes_of(&u));
     }

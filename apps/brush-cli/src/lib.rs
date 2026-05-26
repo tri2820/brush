@@ -448,6 +448,77 @@ pub async fn run_render(
 /// single bound instant and feeds each camera's own Recorder. Each
 /// camera writes to `{output_dir}/{camera.name}.mp4`. macOS-only.
 #[cfg(target_os = "macos")]
+/// Cached per-splat data used to build per-NPC ambient probes: world
+/// position and the direction-average RGB color of each splat. The
+/// color comes from the SH degree-0 coefficient (which IS the
+/// direction-independent component of the radiance distribution) via
+/// the standard gsplat convention `rgb = 0.5 + SH_C0 * f_dc`.
+struct SplatProbeData {
+    positions: Vec<glam::Vec3>,
+    colors: Vec<glam::Vec3>,
+}
+
+/// SH degree-0 basis coefficient. The gaussian-splatting community
+/// stores `f_dc_0..2` as raw SH coefficients; the rendered base color
+/// is `0.5 + SH_C0 * f_dc`. Pre-applied to convert DC tensor values
+/// directly to "albedo at average direction" colors.
+const SH_C0: f32 = 0.282_094_79;
+
+/// Sample one NPC's 6-tap directional ambient probe (±X/±Y/±Z) by
+/// averaging nearby splat colors weighted by `max(dot(splat_dir, axis),
+/// 0)`. Probe radius and the minimum weight per axis are tuned for
+/// "warehouse-scale interior" — at scale, splats far past the radius
+/// contribute negligibly and ignoring them keeps the per-NPC sampling
+/// O(splat_count) but with a fast distance reject.
+fn compute_ambient_cube(npc_pos: glam::Vec3, probe: &SplatProbeData) -> [[f32; 3]; 6] {
+    const PROBE_RADIUS: f32 = 5.0;
+    const RADIUS_SQ: f32 = PROBE_RADIUS * PROBE_RADIUS;
+    // Use the world's actual up axis (Y-down in the supersplat scene)
+    // as the probe basis. The axes below are in the same world frame
+    // we render in; the per-NPC X-flip rotation we apply elsewhere
+    // doesn't matter here because we look up the cube by world normal
+    // in the fragment shader.
+    let axes = [
+        glam::Vec3::X,
+        glam::Vec3::NEG_X,
+        glam::Vec3::Y,
+        glam::Vec3::NEG_Y,
+        glam::Vec3::Z,
+        glam::Vec3::NEG_Z,
+    ];
+    let mut sums = [glam::Vec3::ZERO; 6];
+    let mut weights = [0.0_f32; 6];
+    for (&pos, &color) in probe.positions.iter().zip(probe.colors.iter()) {
+        let delta = pos - npc_pos;
+        let dist_sq = delta.length_squared();
+        if dist_sq > RADIUS_SQ {
+            continue;
+        }
+        let dir = delta.normalize_or_zero();
+        // Falloff with 1/(1 + dist^2) so nearby splats dominate.
+        let falloff = 1.0 / (1.0 + dist_sq);
+        for i in 0..6 {
+            let w = dir.dot(axes[i]).max(0.0) * falloff;
+            if w > 0.0 {
+                sums[i] += color * w;
+                weights[i] += w;
+            }
+        }
+    }
+    let mut out = [[0.0_f32; 3]; 6];
+    for i in 0..6 {
+        if weights[i] > 0.0 {
+            let c = sums[i] / weights[i];
+            out[i] = c.into();
+        } else {
+            // No splats biased toward this axis — neutral mid-grey
+            // keeps the character readable instead of pitch-black.
+            out[i] = [0.5, 0.5, 0.5];
+        }
+    }
+    out
+}
+
 pub async fn run_record(
     process: RunningProcess,
     args: RenderArgs,
@@ -458,6 +529,7 @@ pub async fn run_record(
     use brush_record::{Codec, Recorder, RecorderConfig};
     use brush_render::burn_glue::resolve_to_cube_float;
     use brush_render::{TextureMode, gaussian_splats::render_splats};
+    use burn::tensor::s;
 
     let total = args
         .record_frames
@@ -467,6 +539,43 @@ pub async fn run_record(
     let (splats, scene) = load_splats_and_scene(process, &args).await?;
     tokio::fs::create_dir_all(&args.output_dir).await?;
     let background = glam::Vec3::from(scene.background);
+
+    // Pull splat positions + degree-0 SH coefficients off the GPU so
+    // we can build per-NPC ambient probes on the CPU. One-shot at
+    // setup — the splats themselves are static through the recording.
+    let probe = if !scene.npcs.is_empty() {
+        let means_data = splats.means().into_data_async().await?;
+        let means_vec = means_data
+            .into_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("means readback: {e:?}"))?;
+        let sh = splats.sh_coeffs.val().slice(s![.., 0..1, ..]);
+        let sh_data = sh.into_data_async().await?;
+        let sh_vec = sh_data
+            .into_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("sh readback: {e:?}"))?;
+        let n = means_vec.len() / 3;
+        let mut positions = Vec::with_capacity(n);
+        let mut colors = Vec::with_capacity(n);
+        for i in 0..n {
+            positions.push(glam::vec3(
+                means_vec[i * 3],
+                means_vec[i * 3 + 1],
+                means_vec[i * 3 + 2],
+            ));
+            // gsplat convention: rgb = 0.5 + SH_C0 * f_dc. Clamp into
+            // [0,1] — degenerate splats can have huge SH values.
+            let c = glam::vec3(
+                (0.5 + SH_C0 * sh_vec[i * 3]).clamp(0.0, 1.0),
+                (0.5 + SH_C0 * sh_vec[i * 3 + 1]).clamp(0.0, 1.0),
+                (0.5 + SH_C0 * sh_vec[i * 3 + 2]).clamp(0.0, 1.0),
+            );
+            colors.push(c);
+        }
+        log::info!("Built splat probe with {} colored points", n);
+        Some(SplatProbeData { positions, colors })
+    } else {
+        None
+    };
 
     // Shared mesh renderer state. One per cli invocation; bind groups
     // and depth target are owned by MeshRenderer.
@@ -530,7 +639,27 @@ pub async fn run_record(
             rot,
             glam::Vec3::from(npc.pos),
         );
-        let instance = mesh_renderer.make_instance(&device, gpu, model, npc.color);
+        // Ambient probe sampled at the NPC's *starting* world
+        // position. As the NPC walks the probe doesn't refresh — for
+        // walks of a few meters in a roughly-uniform interior the
+        // color cast stays consistent and the cost (~one second per
+        // NPC at 1.5M splats in debug) doesn't have to be paid each
+        // frame. P2 follow-up: recompute on a coarse grid as the NPC
+        // moves between zones.
+        let anchor = match &npc.path {
+            Some(PathConfig::Linear { start, .. }) => glam::Vec3::from(*start),
+            None => glam::Vec3::from(npc.pos),
+        };
+        let ambient = match &probe {
+            Some(p) => compute_ambient_cube(anchor, p),
+            None => [[0.5, 0.5, 0.5]; 6],
+        };
+        log::info!(
+            "ambient cube for '{}' at {anchor:?}: {ambient:?}",
+            npc.name
+        );
+        let instance =
+            mesh_renderer.make_instance(&device, gpu, model, npc.color, ambient);
         let animation_index = match &npc.animation {
             Some(name) => {
                 let idx = asset.animations.iter().position(|a| &a.name == name);
@@ -631,7 +760,7 @@ pub async fn run_record(
                     rot,
                     pos,
                 );
-                rt.instance.set_model(&queue, model, npc.color);
+                rt.instance.set_model(&queue, model, npc.color, rt.instance.ambient_cube);
             }
 
             let anim = rt.animation_index.map(|i| &asset.animations[i]);

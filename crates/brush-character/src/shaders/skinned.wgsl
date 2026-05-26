@@ -18,6 +18,9 @@ struct InstanceUniforms {
     model: mat4x4<f32>,
     base_color: vec3<f32>,
     _pad: f32,
+    // 6-tap ambient cube in world frame: +X, -X, +Y, -Y, +Z, -Z. Each
+    // entry is RGB in linear color space (xyz; .w is padding).
+    ambient_cube: array<vec4<f32>, 6>,
 };
 
 struct MaterialUniforms {
@@ -122,16 +125,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         world_normal = normalize(tangent_n.x * t + tangent_n.y * b + tangent_n.z * n);
     }
 
-    // 3. Linear-space lighting: ambient + key + fill, all in linear.
-    //    These directions are chosen to match an indoors-with-skylight
-    //    feel; once we have splat-derived ambient (PBR P2), this gets
-    //    replaced.
-    let key_dir = normalize(vec3<f32>(0.4, 0.8, 0.3));
-    let fill_dir = normalize(vec3<f32>(-0.2, -0.5, -0.4));
-    let key = max(dot(world_normal, key_dir), 0.0);
-    let fill = max(dot(world_normal, fill_dir), 0.0) * 0.35;
-    let ambient = 0.35;
-    let lit = base_color * (ambient + key + fill);
+    // 3. Linear-space lighting. Ambient now comes from the
+    //    splat-derived 6-tap cube: weight each axis by max(dot(n,
+    //    axis), 0)² so the character absorbs the scene's color cast
+    //    in the direction the surface faces. A small direct key light
+    //    gives shape on top of the ambient (otherwise the character
+    //    reads as a flat sticker against the scene).
+    let cube_weights = vec3<f32>(
+        world_normal.x * world_normal.x,
+        world_normal.y * world_normal.y,
+        world_normal.z * world_normal.z,
+    );
+    let ambient_color =
+        instance.ambient_cube[select(1u, 0u, world_normal.x > 0.0)].rgb * cube_weights.x +
+        instance.ambient_cube[select(3u, 2u, world_normal.y > 0.0)].rgb * cube_weights.y +
+        instance.ambient_cube[select(5u, 4u, world_normal.z > 0.0)].rgb * cube_weights.z;
+    // Soft key light from above-front to give the character form on
+    // top of the (often diffuse) ambient.
+    let key_dir = normalize(vec3<f32>(0.3, -0.7, 0.4));  // Y-down world: -Y is up
+    let key = max(dot(world_normal, key_dir), 0.0) * 0.3;
+    let lit = base_color * (ambient_color + vec3<f32>(key));
 
     // 4. sRGB-encode for the non-sRGB IOSurface target. Matches the
     //    splat path's implicit assumption that bytes-as-stored are
