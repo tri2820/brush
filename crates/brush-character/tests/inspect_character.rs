@@ -153,4 +153,22 @@ fn dump_character_bounds() {
             println!("    Y=[{:.1}, {:.1}): {} vertices", i as f32 * 0.1, (i + 1) as f32 * 0.1, c);
         }
     }
+
+    // Dump root-joint (joint 0) translation at sample t values for every
+    // animation. If a Walk loop has root motion, the translation will
+    // sweep forward then snap back at the loop point — that's the
+    // "jitter" the path-driven motion stacks on top of.
+    for anim in &asset.animations {
+        println!("\nAnimation '{}' duration={:.3}s:", anim.name, anim.duration);
+        let n = 8;
+        for k in 0..=n {
+            let t = (k as f32 / n as f32) * anim.duration;
+            let mats = asset.skeleton.evaluate(Some(anim), t);
+            let root_t = mats[0].w_axis;
+            println!(
+                "  t={:.3}s  root_skin_translate=({:.4}, {:.4}, {:.4})",
+                t, root_t.x, root_t.y, root_t.z
+            );
+        }
+    }
 }

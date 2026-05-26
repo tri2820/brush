@@ -32,6 +32,17 @@ impl Skeleton {
                     apply_channel(ch, t_wrapped, &mut translation, &mut rotation, &mut scale);
                 }
             }
+            // Strip root-joint translation: Mixamo's "with displacement"
+            // walks animate the root forward over the cycle and then snap
+            // back at the loop point. The NPC's world position is driven
+            // by `path.position(t)` in the outer loop, so anim's root
+            // motion would double-count and produce a visible "walk
+            // forward, snap back" jitter. Keep the root's bind
+            // translation (its rest XYZ) and rely on rotation/scale of
+            // child joints for the actual gait.
+            if i == 0 {
+                translation = joint.bind_translation;
+            }
             local[i] = Mat4::from_scale_rotation_translation(scale, rotation, translation);
         }
         // 2. Compose into global transforms via a single forward pass —
