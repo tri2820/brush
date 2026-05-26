@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::trace_span;
 
+/// File extension used per output file in `RenderArgs::output_dir`.
+const PNG_EXT: &str = "png";
+const MP4_EXT: &str = "mp4";
+
 #[derive(Parser)]
 #[command(
     author,
@@ -33,9 +37,7 @@ pub struct Cli {
         long,
         default_value = "true",
         default_value_if("source", ArgPredicate::IsPresent, "false"),
-        default_value_if("render_output", ArgPredicate::IsPresent, "false"),
         default_value_if("scene", ArgPredicate::IsPresent, "false"),
-        default_value_if("record_output", ArgPredicate::IsPresent, "false"),
         help = "Spawn a viewer to visualize the training"
     )]
     pub with_viewer: bool,
@@ -47,127 +49,44 @@ pub struct Cli {
     pub render: RenderArgs,
 }
 
-/// Arguments for the headless render-to-PNG mode. Activated by passing
-/// `--render-output` (single camera) or `--scene` (multi-camera from a
-/// JSON config). In either mode the CLI loads the source, renders, and
-/// exits.
+/// Arguments for headless rendering or recording. `--scene PATH` is the
+/// single source of truth for camera setup; presence of `--record-frames`
+/// switches from one-PNG-per-camera output to one-mp4-per-camera output.
 #[derive(Args, Clone, Debug)]
 pub struct RenderArgs {
-    /// Write a single rendered PNG to this path and exit. Mutually
-    /// exclusive with --scene.
+    /// JSON config with one or more named cameras. Without
+    /// `--record-frames`, writes one PNG per camera. With it, records
+    /// one mp4 per camera, all frames synchronized to a single
+    /// world-state advance per frame.
     #[arg(long, value_name = "PATH")]
-    pub render_output: Option<PathBuf>,
-
-    /// JSON config with one or more named cameras; renders one PNG per
-    /// camera into --output-dir. Mutually exclusive with --render-output.
-    #[arg(long, value_name = "PATH", conflicts_with = "render_output")]
     pub scene: Option<PathBuf>,
 
-    /// Output directory for --scene mode. Per-camera files are written
-    /// as `{output_dir}/{camera.name}.png`.
+    /// Output directory. Per-camera files are written as
+    /// `{output_dir}/{camera.name}.{png|mp4}`.
     #[arg(long, value_name = "DIR", default_value = "./out")]
     pub output_dir: PathBuf,
 
-    /// (macOS only) Record an H.265 .mp4 to this path. Uses real
-    /// GPU-side recording: brush's rasterized tensor → IOSurface-backed
-    /// Metal texture → VideoToolbox encoder, no CPU pixel touch.
-    #[arg(long, value_name = "PATH")]
-    pub record_output: Option<PathBuf>,
+    /// Number of frames to record. Presence triggers record mode.
+    #[arg(long)]
+    pub record_frames: Option<u32>,
 
-    /// Number of frames to record. Required with --record-output.
-    #[arg(long, default_value_t = 60)]
-    pub record_frames: u32,
-
-    /// Frames per second of the output video.
+    /// Frames per second of the recorded video.
     #[arg(long, default_value_t = 30)]
     pub record_fps: u32,
-
-    /// When recording with `--scene`, which camera (by `name`) to
-    /// follow. Ignored otherwise; the single-camera flags drive it.
-    #[arg(long)]
-    pub record_camera: Option<String>,
-
-    /// Optional yaw sweep across the recording window, in degrees.
-    /// `0` means a static shot; the default 0 ensures we don't add
-    /// unexpected camera motion.
-    #[arg(long, default_value_t = 0.0)]
-    pub record_yaw_sweep_deg: f32,
-
-    /// Camera position in world space, "x,y,z".
-    #[arg(long, value_name = "X,Y,Z", default_value = "0,0,-2.5")]
-    pub camera_pos: Vec3Arg,
-
-    /// World-space point the camera looks at, "x,y,z".
-    #[arg(long, value_name = "X,Y,Z", default_value = "0,0,0")]
-    pub camera_look: Vec3Arg,
-
-    /// World-space up vector hint, "x,y,z".
-    #[arg(long, value_name = "X,Y,Z", default_value = "0,1,0")]
-    pub camera_up: Vec3Arg,
-
-    /// Optional Euler angles "yaw,pitch,roll" in degrees, applied as
-    /// glam's `EulerRot::YXZ` — matches the in-app HUD readout. When
-    /// set, --camera-look / --camera-up are ignored.
-    #[arg(long, value_name = "YAW,PITCH,ROLL")]
-    pub camera_ypr_deg: Option<Vec3Arg>,
-
-    /// Vertical field of view in degrees.
-    #[arg(long, default_value_t = 45.0)]
-    pub fov_y_deg: f64,
-
-    /// Output resolution as WIDTHxHEIGHT.
-    #[arg(long, default_value = "1280x720", value_parser = parse_resolution)]
-    pub resolution: glam::UVec2,
-
-    /// Background color, "r,g,b" in linear 0..1.
-    #[arg(long, value_name = "R,G,B", default_value = "0,0,0")]
-    pub background: Vec3Arg,
-}
-
-/// Newtype wrapper so clap can parse `--foo x,y,z` directly into a glam Vec3
-/// while keeping the existing serde-derived `DataSource` parsing intact.
-#[derive(Clone, Copy, Debug)]
-pub struct Vec3Arg(pub glam::Vec3);
-
-impl std::str::FromStr for Vec3Arg {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() != 3 {
-            return Err(format!("expected 'x,y,z', got {s:?}"));
-        }
-        let parse = |i: usize| {
-            parts[i]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("component {i}: {e}"))
-        };
-        Ok(Self(glam::vec3(parse(0)?, parse(1)?, parse(2)?)))
-    }
-}
-
-fn parse_resolution(s: &str) -> Result<glam::UVec2, String> {
-    let (w, h) = s
-        .split_once('x')
-        .ok_or_else(|| format!("expected WIDTHxHEIGHT, got {s:?}"))?;
-    let w: u32 = w.trim().parse().map_err(|e| format!("width: {e}"))?;
-    let h: u32 = h.trim().parse().map_err(|e| format!("height: {e}"))?;
-    if w == 0 || h == 0 {
-        return Err("resolution must be > 0 in both dimensions".into());
-    }
-    Ok(glam::uvec2(w, h))
 }
 
 impl Cli {
     pub fn validate(self) -> Result<Self, Error> {
-        if (self.render.render_output.is_some()
-            || self.render.scene.is_some()
-            || self.render.record_output.is_some())
-            && self.source.is_none()
-        {
+        if self.render.scene.is_some() && self.source.is_none() {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,
-                "When --render-output / --scene / --record-output is set, --source must be provided",
+                "When --scene is set, --source must be provided",
+            ));
+        }
+        if self.render.record_frames.is_some() && self.render.scene.is_none() {
+            return Err(Error::raw(
+                ErrorKind::MissingRequiredArgument,
+                "--record-frames requires --scene to define which cameras to capture",
             ));
         }
         if !self.with_viewer && self.source.is_none() {
@@ -443,26 +362,177 @@ pub async fn run_cli_ui(
 
 /// Drive a process to `DoneLoading`, then either render a single frame
 /// (`--render-output`) or one frame per camera in `--scene` config.
+/// Headless multi-camera PNG render. One file per camera in
+/// `scene.json` written to `{output_dir}/{camera.name}.png`. All cameras
+/// observe the same world state (a static splat scene for now).
 pub async fn run_render(
-    mut process: RunningProcess,
+    process: RunningProcess,
     args: RenderArgs,
 ) -> Result<(), anyhow::Error> {
+    let (splats, scene) = load_splats_and_scene(process, &args).await?;
+    tokio::fs::create_dir_all(&args.output_dir).await?;
+    let background = glam::Vec3::from(scene.background);
+
+    for entry in &scene.cameras {
+        let (img_size, fov_y_deg) = resolve_size_fov(&scene, entry);
+        let camera = camera_from_ypr(entry.pos.into(), entry.ypr_deg.into(), fov_y_deg, img_size);
+        let output = args.output_dir.join(format!("{}.{PNG_EXT}", entry.name));
+        log::info!(
+            "Rendering camera '{}' at {}x{} → {}",
+            entry.name,
+            img_size.x,
+            img_size.y,
+            output.display(),
+        );
+        render_and_save(splats.clone(), &camera, img_size, background, &output).await?;
+    }
+    Ok(())
+}
+
+/// Parallel multi-camera recording. One outer per-frame loop advances
+/// world state once; the inner loop renders every camera against that
+/// single bound instant and feeds each camera's own Recorder. Each
+/// camera writes to `{output_dir}/{camera.name}.mp4`. macOS-only.
+#[cfg(target_os = "macos")]
+pub async fn run_record(
+    process: RunningProcess,
+    args: RenderArgs,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<(), anyhow::Error> {
+    use brush_record::{Codec, Recorder, RecorderConfig};
+    use brush_render::burn_glue::resolve_to_cube_float;
+    use brush_render::{TextureMode, gaussian_splats::render_splats};
+
+    let total = args
+        .record_frames
+        .ok_or_else(|| anyhow::anyhow!("run_record called without --record-frames"))?;
+    let total = total.max(1);
+
+    let (splats, scene) = load_splats_and_scene(process, &args).await?;
+    tokio::fs::create_dir_all(&args.output_dir).await?;
+    let background = glam::Vec3::from(scene.background);
+
+    // One Recorder per camera, alive for the whole capture. Each owns
+    // its own AVAssetWriter + IOSurface texture cache + swizzle pipeline.
+    struct Cam {
+        entry: CameraEntry,
+        img_size: glam::UVec2,
+        fov_y_deg: f64,
+        recorder: Recorder,
+    }
+    let mut cams: Vec<Cam> = Vec::with_capacity(scene.cameras.len());
+    for entry in &scene.cameras {
+        let (img_size, fov_y_deg) = resolve_size_fov(&scene, entry);
+        let output = args.output_dir.join(format!("{}.{MP4_EXT}", entry.name));
+        log::info!(
+            "Opening recorder for camera '{}' at {}x{} → {}",
+            entry.name,
+            img_size.x,
+            img_size.y,
+            output.display(),
+        );
+        let recorder = Recorder::new(
+            device.clone(),
+            queue.clone(),
+            &output,
+            RecorderConfig {
+                width: img_size.x,
+                height: img_size.y,
+                fps: args.record_fps,
+                codec: Codec::Hevc,
+            },
+        )?;
+        cams.push(Cam {
+            entry: entry.clone(),
+            img_size,
+            fov_y_deg,
+            recorder,
+        });
+    }
+
+    log::info!(
+        "Recording {} frames at {} fps across {} cameras...",
+        total,
+        args.record_fps,
+        cams.len(),
+    );
+
+    let t_start = std::time::Instant::now();
+    for _frame in 0..total {
+        // Single world-state advance per frame would go here once
+        // there's animated content (character pose, time-varying
+        // lights, etc.). For now the scene is static; every camera
+        // sees the same Splats this iteration.
+        for cam in &mut cams {
+            let camera = camera_from_ypr(
+                cam.entry.pos.into(),
+                cam.entry.ypr_deg.into(),
+                cam.fov_y_deg,
+                cam.img_size,
+            );
+            let (tensor, _aux) = render_splats(
+                splats.clone(),
+                &camera,
+                cam.img_size,
+                background,
+                None,
+                TextureMode::Packed,
+            )
+            .await;
+            let cube = resolve_to_cube_float(tensor);
+            let resource = cube
+                .client
+                .get_resource(cube.handle.clone())
+                .map_err(|e| anyhow::anyhow!("get_resource failed: {e:?}"))?;
+            // Fence brush's submission before the swizzle reads the
+            // buffer — otherwise the shader sees the buffer's initial
+            // (zero) state.
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let res = resource.resource();
+            cam.recorder.write_frame(&res.buffer, res.offset)?;
+        }
+    }
+
+    for cam in cams {
+        cam.recorder.finish().await?;
+    }
+
+    let elapsed = t_start.elapsed();
+    let total_frames = total as f64 * scene.cameras.len() as f64;
+    log::info!(
+        "Wrote {} frames across {} cameras in {:.2?} ({:.1} frames/s aggregate)",
+        total,
+        scene.cameras.len(),
+        elapsed,
+        total_frames / elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// Drive `process.stream` to `DoneLoading`, parse the scene config,
+/// validate that we have at least one camera. Shared by render + record.
+async fn load_splats_and_scene(
+    mut process: RunningProcess,
+    args: &RenderArgs,
+) -> Result<(brush_render::gaussian_splats::Splats, SceneConfig), anyhow::Error> {
+    let scene_path = args
+        .scene
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--scene is required"))?;
     log::info!("Loading source...");
     while let Some(msg) = process.stream.next().await {
         match msg? {
             ProcessMessage::DoneLoading => break,
             ProcessMessage::StartLoading { training, .. } if training => {
                 anyhow::bail!(
-                    "render mode expects a single .ply / .compressed.ply source, not a training dataset"
+                    "render/record mode expects a single .ply / .compressed.ply source, not a training dataset"
                 );
             }
-            ProcessMessage::Warning { error } => {
-                log::warn!("{error}");
-            }
+            ProcessMessage::Warning { error } => log::warn!("{error}"),
             _ => {}
         }
     }
-
     let splats = process
         .splat_view
         .latest()
@@ -473,215 +543,24 @@ pub async fn run_render(
         splats.sh_degree(),
     );
 
-    if let Some(scene_path) = args.scene.as_ref() {
-        let raw = tokio::fs::read_to_string(scene_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", scene_path.display()))?;
-        let scene: SceneConfig = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("invalid scene config {}: {e}", scene_path.display()))?;
-        if scene.cameras.is_empty() {
-            anyhow::bail!("scene config has no cameras");
-        }
-        tokio::fs::create_dir_all(&args.output_dir).await?;
-        // All cameras render the same `splats` instance — when an
-        // animated character lands later, each per-frame loop iteration
-        // will bind a single (time, character_pose) and render every
-        // camera against that shared world state in sequence, so the
-        // cameras observe the same scene at the same instant.
-        for entry in &scene.cameras {
-            let img_size = entry
-                .resolution
-                .map(|[w, h]| glam::uvec2(w, h))
-                .unwrap_or_else(|| glam::uvec2(scene.resolution[0], scene.resolution[1]));
-            let fov_y_deg = entry.fov_y_deg.unwrap_or(scene.fov_y_deg);
-            let camera = camera_from_ypr(entry.pos.into(), entry.ypr_deg.into(), fov_y_deg, img_size);
-            let output = args.output_dir.join(format!("{}.png", entry.name));
-            log::info!(
-                "Rendering camera '{}' at {}x{} → {}",
-                entry.name,
-                img_size.x,
-                img_size.y,
-                output.display(),
-            );
-            render_and_save(
-                splats.clone(),
-                &camera,
-                img_size,
-                glam::Vec3::from(scene.background),
-                &output,
-            )
-            .await?;
-        }
-    } else if args.render_output.is_some() {
-        let output = args
-            .render_output
-            .as_ref()
-            .expect("render_output checked");
-        let camera = build_camera(&args);
-        log::info!(
-            "Rendering at {}x{} → {}",
-            args.resolution.x,
-            args.resolution.y,
-            output.display(),
-        );
-        render_and_save(splats, &camera, args.resolution, args.background.0, output).await?;
+    let raw = tokio::fs::read_to_string(scene_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", scene_path.display()))?;
+    let scene: SceneConfig = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("invalid scene config {}: {e}", scene_path.display()))?;
+    if scene.cameras.is_empty() {
+        anyhow::bail!("scene config has no cameras");
     }
-
-    Ok(())
+    Ok((splats, scene))
 }
 
-/// Drive the recording pipeline: load the source, then render `record_frames`
-/// frames to an .mp4 via the GPU-side zero-copy path (Buffer → IOSurface
-/// texture → VideoToolbox). macOS-only.
-#[cfg(target_os = "macos")]
-pub async fn run_record(
-    mut process: RunningProcess,
-    args: RenderArgs,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-) -> Result<(), anyhow::Error> {
-    use brush_record::{Codec, Recorder, RecorderConfig};
-    use brush_render::{TextureMode, gaussian_splats::render_splats};
-    use brush_render::burn_glue::resolve_to_cube_float;
-
-    let output = args
-        .record_output
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("record_output unset"))?;
-
-    log::info!("Loading source for recording...");
-    while let Some(msg) = process.stream.next().await {
-        match msg? {
-            ProcessMessage::DoneLoading => break,
-            ProcessMessage::StartLoading { training, .. } if training => {
-                anyhow::bail!(
-                    "--record-output expects a single .ply / .compressed.ply, not a training dataset"
-                );
-            }
-            ProcessMessage::Warning { error } => log::warn!("{error}"),
-            _ => {}
-        }
-    }
-    let splats = process
-        .splat_view
-        .latest()
-        .ok_or_else(|| anyhow::anyhow!("no splats loaded"))?;
-
-    // Resolve the base camera (single-camera flags) or pick the named
-    // camera out of --scene.
-    let (base_pos, base_ypr, fov_y_deg, img_size, background) =
-        if let Some(scene_path) = args.scene.as_ref() {
-            let raw = tokio::fs::read_to_string(scene_path).await?;
-            let scene: SceneConfig = serde_json::from_str(&raw)?;
-            let want = args
-                .record_camera
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--scene with --record-output requires --record-camera <name>"))?;
-            let entry = scene
-                .cameras
-                .iter()
-                .find(|c| c.name == want)
-                .ok_or_else(|| anyhow::anyhow!("camera '{want}' not found in scene"))?;
-            let img_size = entry
-                .resolution
-                .map(|[w, h]| glam::uvec2(w, h))
-                .unwrap_or_else(|| glam::uvec2(scene.resolution[0], scene.resolution[1]));
-            (
-                glam::Vec3::from(entry.pos),
-                glam::Vec3::from(entry.ypr_deg),
-                entry.fov_y_deg.unwrap_or(scene.fov_y_deg),
-                img_size,
-                glam::Vec3::from(scene.background),
-            )
-        } else {
-            (
-                args.camera_pos.0,
-                args.camera_ypr_deg
-                    .map(|v| v.0)
-                    .ok_or_else(|| anyhow::anyhow!("--record-output requires --camera-ypr-deg or --scene"))?,
-                args.fov_y_deg,
-                args.resolution,
-                args.background.0,
-            )
-        };
-
-    let mut recorder = Recorder::new(
-        device.clone(),
-        queue.clone(),
-        output,
-        RecorderConfig {
-            width: img_size.x,
-            height: img_size.y,
-            fps: args.record_fps,
-            codec: Codec::Hevc,
-        },
-    )?;
-
-    let total = args.record_frames.max(1);
-    log::info!(
-        "Recording {} frames at {} fps, {}x{} → {}",
-        total,
-        args.record_fps,
-        img_size.x,
-        img_size.y,
-        output.display(),
-    );
-
-    let t_start = std::time::Instant::now();
-    for frame in 0..total {
-        // Optional yaw sweep so successive frames differ even on a
-        // static-camera shot (useful for sanity-checking pipelining).
-        let t = if total > 1 {
-            frame as f32 / (total - 1) as f32
-        } else {
-            0.0
-        };
-        let ypr = glam::vec3(
-            base_ypr.x + args.record_yaw_sweep_deg * (t - 0.5),
-            base_ypr.y,
-            base_ypr.z,
-        );
-        let camera = camera_from_ypr(base_pos, ypr, fov_y_deg, img_size);
-
-        // Packed mode: output is [h, w, 1] f32 whose bytes are u32
-        // RGBA8 packed values — exactly what the swizzle shader reads.
-        let (tensor, _aux) = render_splats(
-            splats.clone(),
-            &camera,
-            img_size,
-            background,
-            None,
-            TextureMode::Packed,
-        )
-        .await;
-
-        // Drain fusion to get a concrete CubeTensor with a real handle,
-        // then dig out the underlying wgpu::Buffer to feed the swizzle
-        // shader.
-        let cube = resolve_to_cube_float(tensor);
-        let resource = cube
-            .client
-            .get_resource(cube.handle.clone())
-            .map_err(|e| anyhow::anyhow!("get_resource failed: {e:?}"))?;
-        // brush's render commands are merely submitted by this point;
-        // fence them before the swizzle reads the buffer, otherwise the
-        // shader sees the buffer's initial (zero) state.
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        // ManagedResource wraps the underlying server resource (which
-        // holds the wgpu::Buffer); `.resource()` exposes it.
-        let res = resource.resource();
-        recorder.write_frame(&res.buffer, res.offset)?;
-    }
-    recorder.finish().await?;
-
-    let elapsed = t_start.elapsed();
-    log::info!(
-        "Wrote {} frames in {:.2?} ({:.1} fps)",
-        total,
-        elapsed,
-        total as f64 / elapsed.as_secs_f64(),
-    );
-    Ok(())
+fn resolve_size_fov(scene: &SceneConfig, entry: &CameraEntry) -> (glam::UVec2, f64) {
+    let img_size = entry
+        .resolution
+        .map(|[w, h]| glam::uvec2(w, h))
+        .unwrap_or_else(|| glam::uvec2(scene.resolution[0], scene.resolution[1]));
+    let fov_y_deg = entry.fov_y_deg.unwrap_or(scene.fov_y_deg);
+    (img_size, fov_y_deg)
 }
 
 /// Render `splats` with `camera` at `img_size` against `background` and
@@ -753,54 +632,3 @@ fn camera_from_ypr(
     )
 }
 
-fn build_camera(args: &RenderArgs) -> brush_render::camera::Camera {
-    use brush_render::camera::Camera;
-    use brush_render::kernels::camera_model::CameraModel;
-    use glam::{EulerRot, Mat3, Quat, Vec3};
-
-    let eye = args.camera_pos.0;
-
-    let rotation = if let Some(ypr) = args.camera_ypr_deg {
-        let v = ypr.0;
-        Quat::from_euler(
-            EulerRot::YXZ,
-            v.x.to_radians(),
-            v.y.to_radians(),
-            v.z.to_radians(),
-        )
-    } else {
-        let target = args.camera_look.0;
-        let up_hint = args.camera_up.0;
-        // Camera-local axes: +X right, +Y up, +Z forward (camera looks
-        // down +Z). See brush-render::camera::Camera and
-        // camera_controls.rs, where `position + rotation * Vec3::Z *
-        // focus_distance` is the look-at pivot.
-        let forward = (target - eye).normalize_or_zero();
-        let forward = if forward.length_squared() < 1e-12 {
-            Vec3::Z
-        } else {
-            forward
-        };
-        let mut up_hint = up_hint.normalize_or(Vec3::Y);
-        if up_hint.cross(forward).length_squared() < 1e-6 {
-            up_hint = if forward.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
-        }
-        let right = up_hint.cross(forward).normalize();
-        let cam_up = forward.cross(right);
-        let rot_mat = Mat3::from_cols(right, cam_up, forward);
-        Quat::from_mat3(&rot_mat)
-    };
-
-    let aspect = args.resolution.x as f64 / args.resolution.y as f64;
-    let fov_y = args.fov_y_deg.to_radians();
-    let fov_x = 2.0 * ((fov_y / 2.0).tan() * aspect).atan();
-
-    Camera::new(
-        eye,
-        rotation,
-        fov_x,
-        fov_y,
-        glam::vec2(0.5, 0.5),
-        CameraModel::Pinhole,
-    )
-}

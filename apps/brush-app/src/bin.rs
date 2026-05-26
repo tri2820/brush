@@ -56,7 +56,7 @@ fn main() -> Result<(), anyhow::Error> {
             });
 
             #[cfg(target_os = "macos")]
-            if args.render.record_output.is_some() {
+            if args.render.record_frames.is_some() {
                 // Build wgpu Instance/Adapter/Device/Queue manually so we
                 // own handles the recorder (IOSurface texture import,
                 // swizzle compute) can share with burn.
@@ -97,14 +97,14 @@ fn main() -> Result<(), anyhow::Error> {
                 // `burn_init_device` consumes adapter; clones of
                 // device/queue stay for our recorder.
                 brush_process::burn_init_device(adapter, device.clone(), queue.clone());
-                let process = init_process.expect("Must provide a source for --record-output");
+                let process = init_process.expect("Must provide a source for --record-frames");
                 brush_cli::run_record(process, args.render, device, queue).await?;
                 return anyhow::Result::<(), anyhow::Error>::Ok(());
             }
 
-            if args.render.render_output.is_some() || args.render.scene.is_some() {
+            if args.render.scene.is_some() {
                 brush_process::burn_init_setup().await;
-                let process = init_process.expect("Must provide a source for render mode");
+                let process = init_process.expect("Must provide a source for --scene");
                 brush_cli::run_render(process, args.render).await?;
             } else if args.with_viewer {
                 use crate::ui::app::App;
