@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Record clips for every camera in scene.json using sensible defaults.
+# Override anything by passing extra flags, e.g.:
+#   ./record --record-frames 200 --record-fps 30
+#   ./record --output-dir takes/
+#   ./record /some/other/scene.ply --scene other_scene.json
+#
+# Build defaults to debug for fast iteration; pass --release to optimize.
+
+set -euo pipefail
+
+DEFAULT_SOURCE="/Users/tri/pc-refs/supersplat-viewer/scenes/604b6d93.ply"
+DEFAULT_SCENE="scene.json"
+DEFAULT_FRAMES=80
+DEFAULT_FPS=10
+DEFAULT_OUTPUT_DIR="out/"
+
+CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
+
+# Strip leading `--release` from args so we can pass it to cargo but not
+# to the binary.
+RELEASE=""
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --release) RELEASE="--release" ;;
+        *)         ARGS+=("$a") ;;
+    esac
+done
+
+# Pick the source: first positional arg if given, else the default.
+SOURCE="$DEFAULT_SOURCE"
+if [[ ${#ARGS[@]} -gt 0 && ! "${ARGS[0]}" =~ ^- ]]; then
+    SOURCE="${ARGS[0]}"
+    ARGS=("${ARGS[@]:1}")
+fi
+
+echo "==> building brush ($RELEASE)"
+"$CARGO" build $RELEASE -p brush-app --bin brush
+
+if [[ -n "$RELEASE" ]]; then
+    BIN="./target/release/brush"
+else
+    BIN="./target/debug/brush"
+fi
+
+echo "==> recording"
+echo "    source:     $SOURCE"
+echo "    scene:      $DEFAULT_SCENE"
+echo "    frames/fps: $DEFAULT_FRAMES / $DEFAULT_FPS"
+echo "    output:     $DEFAULT_OUTPUT_DIR"
+echo "    extra:      ${ARGS[*]:-(none)}"
+
+"$BIN" "$SOURCE" \
+    --scene "$DEFAULT_SCENE" \
+    --record-frames "$DEFAULT_FRAMES" \
+    --record-fps "$DEFAULT_FPS" \
+    --output-dir "$DEFAULT_OUTPUT_DIR" \
+    ${ARGS[@]+"${ARGS[@]}"}
+
+echo
+echo "==> done"
+ls -la "$DEFAULT_OUTPUT_DIR"
