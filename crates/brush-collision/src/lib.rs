@@ -155,6 +155,93 @@ impl VoxelCollision {
         self.voxel_resolution
     }
 
+    /// Find the world Y of the floor *inside* the carved cavity at
+    /// XZ `(x, z)`. The carved voxel data has a closed-manifold solid
+    /// surrounding an empty interior cavity: ray-casting from outside
+    /// just hits the outer roof, not the floor you walk on. This
+    /// scans the column top-to-bottom (Y-DOWN: numerically smallest
+    /// to largest), passes through the solid roof until it enters the
+    /// empty cavity, then returns the Y of the next solid voxel —
+    /// that's the cavity floor surface.
+    ///
+    /// Returns `None` if the column never enters an empty region or
+    /// the cavity is unbounded below.
+    pub fn cavity_floor_y(&self, x: f32, z: f32) -> Option<f32> {
+        let res = self.voxel_resolution;
+        let ix = ((x - self.grid_min.x) / res).floor() as i64;
+        let iz = ((z - self.grid_min.z) / res).floor() as i64;
+        if ix < 0
+            || iz < 0
+            || ix >= self.num_voxels.x as i64
+            || iz >= self.num_voxels.z as i64
+        {
+            return None;
+        }
+
+        let mut in_cavity = false;
+        for iy in 0..self.num_voxels.y as i64 {
+            let solid = self.is_voxel_solid(ix, iy, iz);
+            if !solid {
+                in_cavity = true;
+            } else if in_cavity {
+                return Some(self.grid_min.y + iy as f32 * res);
+            }
+        }
+        None
+    }
+
+    /// Generate a triangle mesh of just the *top surface* of the
+    /// topmost solid voxel in every XZ column — i.e. the floor the
+    /// physics capsule rests on. Each column contributes one flat quad
+    /// at that voxel's top face.
+    ///
+    /// Used by the viewer's voxel overlay to show "where the collider
+    /// thinks the floor is" without the visual noise of the full
+    /// closed-surface voxel mesh (which also includes the underside of
+    /// the floor, the back of the walls, the void around the warehouse,
+    /// etc.).
+    pub fn floor_surface_mesh(&self) -> (Vec<Vec3>, Vec<u32>) {
+        let res = self.voxel_resolution;
+        let g = self.grid_min;
+        let (nx, ny, nz) = (
+            self.num_voxels.x as i64,
+            self.num_voxels.y as i64,
+            self.num_voxels.z as i64,
+        );
+
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for iz in 0..nz {
+            for ix in 0..nx {
+                // Scan from numerical-low Y (physically high) downward
+                // until we find the first solid voxel. In Y-DOWN world
+                // that voxel's *top* face is the surface we walk on.
+                let mut found: Option<i64> = None;
+                for iy in 0..ny {
+                    if self.is_voxel_solid(ix, iy, iz) {
+                        found = Some(iy);
+                        break;
+                    }
+                }
+                let Some(iy) = found else { continue };
+
+                let x0 = g.x + ix as f32 * res;
+                let x1 = x0 + res;
+                let z0 = g.z + iz as f32 * res;
+                let z1 = z0 + res;
+                let y = g.y + iy as f32 * res; // top face of this voxel
+
+                let base = positions.len() as u32;
+                positions.push(Vec3::new(x0, y, z0));
+                positions.push(Vec3::new(x1, y, z0));
+                positions.push(Vec3::new(x1, y, z1));
+                positions.push(Vec3::new(x0, y, z1));
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+        (positions, indices)
+    }
+
     /// True if the voxel containing world point `p` is solid.
     pub fn is_solid(&self, p: Vec3) -> bool {
         let v = ((p - self.grid_min) / self.voxel_resolution).floor();

@@ -170,9 +170,24 @@ impl NpcSystem {
                 None => None,
             };
 
-            let initial_y = match &npc.path {
-                Some(PathConfig::Linear { start, .. }) => start[1],
-                None => npc.pos[1],
+            // The voxel data is a closed-manifold solid around the
+            // navigable cavity — ray-casting from above hits the outer
+            // ROOF, not the inner floor. Use cavity_floor_y to scan
+            // through the roof into the cavity and find the actual
+            // floor surface. Seed the NPC just above it so gravity +
+            // capsule pushout settles them naturally.
+            let authored_start = match &npc.path {
+                Some(PathConfig::Linear { start, .. }) => Vec3::from(*start),
+                None => Vec3::from(npc.pos),
+            };
+            let initial_y = match &collision {
+                Some(c) => c
+                    .cavity_floor_y(authored_start.x, authored_start.z)
+                    // Spawn 1.0 m above floor so the body capsule fits
+                    // inside the cavity at start; gravity drops them.
+                    .map(|fy| fy - 1.0)
+                    .unwrap_or(authored_start.y),
+                None => authored_start.y,
             };
 
             runtimes.push(NpcRuntime {
