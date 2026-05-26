@@ -4,7 +4,7 @@
   "fov_y_deg": 45.8,
   "background": [0.0, 0.0, 0.0],
   "collision": "assets/collision/604b6d93.voxel.json",
-  "floor_offset_y": 0.75,
+  "floor_offset_y": 0.0,
   "cameras": [
     {
       "name": "cam_warehouse_floor",
