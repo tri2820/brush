@@ -4,6 +4,7 @@
   "fov_y_deg": 45.8,
   "background": [0.0, 0.0, 0.0],
   "collision": "assets/collision/604b6d93.voxel.json",
+  "voxel_mesh_overlay": "assets/collision/604b6d93.collision.glb",
   "floor_offset_y": 0.0,
   "cameras": [
     {
