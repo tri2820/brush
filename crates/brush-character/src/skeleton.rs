@@ -44,7 +44,13 @@ impl Skeleton {
         for i in 0..n {
             global[i] = match self.joints[i].parent {
                 Some(p) => global[p as usize] * local[i],
-                None => local[i],
+                // Root joint: the joint's local transform composes
+                // with the Armature transform sitting above the
+                // topmost joint in the glTF scene graph (carries
+                // cm→m scale + any pre-rotation). The skin's
+                // inverseBindMatrices are computed against this
+                // global pose, so we have to mirror it here.
+                None => self.armature * local[i],
             };
         }
         // 3. Skinning matrix = global_animated * inverse_bind.

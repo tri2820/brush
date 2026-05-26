@@ -470,9 +470,16 @@ pub async fn run_record(
     // Per-NPC GPU instance: model matrix uniform + skin matrices
     // storage. T-pose for now; phase 3 swaps the skin matrices each
     // frame from the animation evaluator.
-    let mut npc_instances: Vec<(usize, NpcInstance)> = Vec::with_capacity(scene.npcs.len());
+    // Per NPC: GPU instance + index of the active animation in
+    // `mesh_cache[asset_path].0.animations` (None = static bind pose).
+    struct NpcRuntime {
+        scene_index: usize,
+        instance: NpcInstance,
+        animation_index: Option<usize>,
+    }
+    let mut npc_runtime: Vec<NpcRuntime> = Vec::with_capacity(scene.npcs.len());
     for (i, npc) in scene.npcs.iter().enumerate() {
-        let (_asset, gpu) = mesh_cache.get(&npc.asset).expect("just inserted");
+        let (asset, gpu) = mesh_cache.get(&npc.asset).expect("just inserted");
         // The supersplat warehouse scene uses Y-DOWN world coords (see
         // earlier camera calibration: yaw/pitch derived assuming +Y is
         // down). The Meshy/Mixamo character is Y-UP. Flip it via a
@@ -488,8 +495,26 @@ pub async fn run_record(
             rot,
             glam::Vec3::from(npc.pos),
         );
-        let inst = mesh_renderer.make_instance(&device, gpu, model, npc.color);
-        npc_instances.push((i, inst));
+        let instance = mesh_renderer.make_instance(&device, gpu, model, npc.color);
+        let animation_index = match &npc.animation {
+            Some(name) => {
+                let idx = asset.animations.iter().position(|a| &a.name == name);
+                if idx.is_none() {
+                    let available: Vec<_> = asset.animations.iter().map(|a| &a.name).collect();
+                    anyhow::bail!(
+                        "npc '{}': animation '{}' not found in {} (have: {:?})",
+                        npc.name, name, npc.asset.display(), available,
+                    );
+                }
+                idx
+            }
+            None => None,
+        };
+        npc_runtime.push(NpcRuntime {
+            scene_index: i,
+            instance,
+            animation_index,
+        });
     }
 
     struct Cam {
@@ -537,9 +562,19 @@ pub async fn run_record(
     );
 
     let t_start = std::time::Instant::now();
-    for _frame in 0..total {
-        // World state advances here when there's animation. For phase
-        // 2 NPCs are static (T-pose at their declared positions).
+    for frame in 0..total {
+        // World state for this frame. NPCs see the same `t` across
+        // every camera, so all cameras observe identical poses.
+        let world_t = frame as f32 / args.record_fps as f32;
+        for rt in &npc_runtime {
+            let (asset, _gpu) = mesh_cache
+                .get(&scene.npcs[rt.scene_index].asset)
+                .expect("preloaded");
+            let anim = rt.animation_index.map(|i| &asset.animations[i]);
+            let skin_mats = asset.skeleton.evaluate(anim, world_t);
+            rt.instance.upload_skin(&queue, &skin_mats)?;
+        }
+
         for cam in &mut cams {
             let camera = camera_from_ypr(
                 cam.entry.pos.into(),
@@ -572,7 +607,7 @@ pub async fn run_record(
             let mut frame = cam.recorder.begin_frame()?;
             frame.swizzle_from(&res.buffer, res.offset);
 
-            if !npc_instances.is_empty() {
+            if !npc_runtime.is_empty() {
                 // Recompute view-projection in the convention the mesh
                 // shader uses. brush's renderer uses +Z forward; for
                 // wgpu clip space we go through `Mat4::perspective_rh`
@@ -591,16 +626,13 @@ pub async fn run_record(
                 let cam_pos = camera.position;
 
                 mesh_renderer.set_camera(&queue, view_proj, cam_pos);
-                let draws: Vec<_> = npc_instances
+                let draws: Vec<_> = npc_runtime
                     .iter()
-                    .map(|(i, inst)| {
-                        let asset_path = &scene.npcs[*i].asset;
+                    .map(|rt| {
+                        let asset_path = &scene.npcs[rt.scene_index].asset;
                         (
-                            &mesh_cache
-                                .get(asset_path)
-                                .expect("preloaded")
-                                .1,
-                            inst,
+                            &mesh_cache.get(asset_path).expect("preloaded").1,
+                            &rt.instance,
                         )
                     })
                     .collect();

@@ -34,6 +34,13 @@ pub struct MeshAsset {
 #[derive(Debug, Clone)]
 pub struct Skeleton {
     pub joints: Vec<Joint>,
+    /// Cumulative transform of ancestor nodes above the topmost joint
+    /// in the glTF scene graph (e.g. the "Armature" node Mixamo emits,
+    /// which carries the cm→m scale and a pre-rotation). The skin's
+    /// `inverseBindMatrices` are computed against the *global* bind
+    /// pose per the glTF spec, so we have to multiply this in when
+    /// composing the per-frame global transform of root joints.
+    pub armature: Mat4,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +258,36 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
         });
     }
 
+    // Diagnostic: trace the parent chain above the root joint to expose
+    // any ancestor nodes (e.g. the scene's "Armature" group) whose
+    // transforms aren't included in our joint hierarchy. Mixamo files
+    // commonly bake a cm→m scale into such an ancestor, which our
+    // skinning math then needs to be aware of.
+    // Walk above the topmost joint to collect the ancestor chain
+    // transform (typically a single "Armature" node carrying scale +
+    // pre-rotation in Mixamo exports). The skin's inverseBindMatrices
+    // are computed against the *global* bind pose per spec, so this
+    // transform has to be re-applied when composing the global per
+    // frame.
+    let armature = if let Some(root_joint) = skin_joints.first() {
+        let mut ancestor =
+            doc.nodes().find(|n| n.children().any(|c| c.index() == root_joint.index()));
+        let mut m = Mat4::IDENTITY;
+        while let Some(n) = ancestor {
+            let (t, r, s) = n.transform().decomposed();
+            let local = Mat4::from_scale_rotation_translation(
+                Vec3::from(s),
+                Quat::from_array(r),
+                Vec3::from(t),
+            );
+            m = local * m;
+            ancestor = doc.nodes().find(|p| p.children().any(|c| c.index() == n.index()));
+        }
+        m
+    } else {
+        Mat4::IDENTITY
+    };
+
     log::info!(
         "Loaded glb '{}': mesh '{}' prim {}, {} vtx, {} tri, {} joints, {} animations",
         source,
@@ -270,6 +307,7 @@ pub fn load_mesh(path: &Path) -> Result<MeshAsset> {
         indices,
         skeleton: Skeleton {
             joints: skeleton_joints,
+            armature,
         },
         animations,
         source,
