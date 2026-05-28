@@ -45,3 +45,9 @@ brush-app/captures
 local.properties
 *.so
 .claude/settings.local.json
+
+# direnv
+.direnv/
+
+# Dataset collection output directories
+out*/
