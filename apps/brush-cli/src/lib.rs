@@ -52,6 +52,9 @@ pub struct Cli {
 
     #[clap(flatten)]
     pub render: RenderArgs,
+
+    #[clap(flatten)]
+    pub collect: CollectArgs,
 }
 
 /// Arguments for headless rendering or recording. The scene description
@@ -84,6 +87,13 @@ pub struct RenderArgs {
     /// Without this flag, `brush <scene.json>` opens the interactive viewer.
     #[arg(long)]
     pub screenshot: bool,
+
+    /// Render the voxel collision overlay on top of recorded/screenshot
+    /// frames. Off by default so snapshots show the splat unobstructed;
+    /// pass this to debug NPC-vs-collision alignment. The interactive
+    /// viewer's V toggle is independent of this flag.
+    #[arg(long)]
+    pub voxel_overlay: bool,
 }
 
 impl Cli {
@@ -126,25 +136,17 @@ pub struct SceneConfig {
     /// path in later phases).
     #[serde(default)]
     pub npcs: Vec<NpcEntry>,
-    /// Optional voxel-octree collision asset (.voxel.json). When set,
-    /// NPCs with a `path` get gravity + capsule pushout each frame so
-    /// they stand on the floor and respect wall/shelf geometry.
+    /// World Y at which NPC feet land (the floor plane). Defaults to 0
+    /// — same plane the grid widget draws at, so users can verify the
+    /// alignment visually by toggling the grid on. Adjust if a scene's
+    /// visible floor sits at a different Y.
+    #[serde(default)]
+    pub floor_y: f32,
+    /// Optional voxel-octree collision asset (.voxel.json). Currently
+    /// only consumed by the V-key overlay loader for visualization;
+    /// physics uses the flat `floor_y` plane.
     #[serde(default)]
     pub collision: Option<PathBuf>,
-    /// Y-axis bias added to the per-NPC rendered position. Use this to
-    /// compensate for two systematic visual gaps:
-    ///   1. The voxel floor (top of solid voxel) sits *below* the
-    ///      splat's actual visible floor surface — Gaussian splats have
-    ///      a low-opacity "fuzz" layer below the bright surface that
-    ///      the voxelizer (opacity threshold 0.1) doesn't capture.
-    ///   2. The character mesh's lowest vertex is the foot sole, but
-    ///      the visible boot bottom in side-views sits a few cm above
-    ///      that, so the perceived feet-floor gap is ~10 cm bigger
-    ///      than the math predicts.
-    /// Positive values move NPCs *downward* (this scene is Y-DOWN, so
-    /// down = +Y). Tune until the feet visually meet the floor.
-    #[serde(default)]
-    pub floor_offset_y: f32,
     /// Optional `.collision.glb` triangle mesh of the voxel collision
     /// surface (emitted by `splat-transform … -K faces`). When set,
     /// the viewer can toggle it on with the `V` key to overlay where
@@ -229,26 +231,31 @@ pub struct NpcEntry {
     /// material would say; we don't sample materials yet.
     #[serde(default = "default_npc_color")]
     pub color: [f32; 3],
-    /// Optional name of an animation in the glb to play.
+    /// Optional name of the WALK animation in the glb. Played while
+    /// the brain is in a locomotion-walk step; the IDLE pose is the
+    /// skeleton's bind pose (no animation set).
     #[serde(default)]
     pub animation: Option<String>,
-    /// Optional scripted motion path. When present, drives the NPC's
-    /// position and heading each frame.
+    /// Optional brain config. When set, the NPC wanders inside its
+    /// spawn box driven by a PRNG timeline of idle/walk steps (ported
+    /// from `gsa/scripts/brain.gd`). When absent, the NPC stays
+    /// stationary at `pos`.
     #[serde(default)]
-    pub path: Option<PathConfig>,
+    pub brain: Option<BrainConfig>,
 }
 
-/// JSON-tagged path config. The `type` field selects the variant.
+/// Brain config: a deterministic seed plus the AABB the NPC is allowed
+/// to wander inside (so two NPCs in the same warehouse don't collide
+/// with the wall splats).
 #[derive(serde::Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PathConfig {
-    /// Constant-velocity straight line from `start` to `end` over
-    /// `duration_s`. Loops by wrapping `t` modulo duration.
-    Linear {
-        start: [f32; 3],
-        end: [f32; 3],
-        duration_s: f32,
-    },
+#[serde(deny_unknown_fields)]
+pub struct BrainConfig {
+    /// PRNG seed; same seed → same wander timeline across runs.
+    pub seed: u64,
+    /// Min XZ corner of the allowed wander region.
+    pub spawn_min: [f32; 2],
+    /// Max XZ corner of the allowed wander region.
+    pub spawn_max: [f32; 2],
 }
 
 fn default_resolution() -> [u32; 2] {
@@ -687,12 +694,12 @@ pub async fn run_record(
     // Renders on top of the mesh pass per frame so `just snapshot`
     // produces frames that match the viewer-with-V-on view.
     let voxel_overlay = match scene.voxel_mesh_overlay.as_ref() {
-        Some(path) => Some(VoxelOverlay::new(
+        Some(path) if args.voxel_overlay => Some(VoxelOverlay::new(
             &device,
             wgpu::TextureFormat::Bgra8Unorm,
             path,
         )?),
-        None => None,
+        _ => None,
     };
 
     struct Cam {
@@ -820,14 +827,23 @@ pub async fn run_record(
 
             // Voxel collision overlay (matches the viewer's V toggle).
             // Drawn after the mesh pass so it sits visibly on top —
-            // the whole point is to compare against the splat.
+            // the whole point is to compare against the splat. Uses the
+            // splat-aligned convention (`perspective_lh * y_flip *
+            // view`), NOT the NPC mesh's `perspective_rh * X-rotation *
+            // view`. The NPC mesh counter-rotates 180° X in its model
+            // matrix; the GLB has no such counter-rotation, so the NPC
+            // view-projection would flip it relative to the splat.
             if let Some(ov) = voxel_overlay.as_ref() {
                 let aspect = cam.img_size.x as f32 / cam.img_size.y as f32;
-                let view_proj = crate::npc_system::view_projection(
-                    camera.world_to_local(),
+                let proj = glam::Mat4::perspective_lh(
                     cam.fov_y_deg.to_radians() as f32,
                     aspect,
+                    0.05,
+                    1000.0,
                 );
+                let y_flip = glam::Mat4::from_scale(glam::Vec3::new(1.0, -1.0, 1.0));
+                let view = glam::Mat4::from(camera.world_to_local());
+                let view_proj = proj * y_flip * view;
                 let sub = ov.render(
                     &device,
                     &queue,
@@ -854,6 +870,411 @@ pub async fn run_record(
         scene.cameras.len(),
         elapsed,
         total_frames / elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// Arguments for `run_collect` — the synthetic dataset collection mode.
+/// Shares `output_dir`, `record_fps`, and `scene` from `RenderArgs`;
+/// only the fields that are unique to collection live here.
+#[derive(Args, Clone, Debug)]
+pub struct CollectArgs {
+    /// Enable dataset collection mode. When set, `brush <scene.json>
+    /// --collect` renders the full clip pipeline instead of opening the
+    /// viewer.
+    #[arg(long)]
+    pub collect: bool,
+
+    /// Total number of clips to produce.
+    #[arg(long, default_value_t = 100)]
+    pub total_clips: u32,
+
+    /// How many of the total clips will contain a fall segment.
+    #[arg(long, default_value_t = 30)]
+    pub fall_clips: u32,
+
+    /// Duration of each clip in seconds.
+    #[arg(long, default_value_t = 10.0)]
+    pub clip_duration_secs: f32,
+
+    /// Camera names to draw from (comma-separated). Each clip is recorded
+    /// from exactly one camera chosen by a frustum-visibility test at
+    /// fall time (or randomly for walk-only clips).
+    #[arg(long, value_delimiter = ',', default_values_t = vec![
+        String::from("cam_warehouse_floor"),
+        String::from("cam_warehouse_wide"),
+    ])]
+    pub collect_cameras: Vec<String>,
+
+    /// Global PRNG seed for clip-type shuffle and per-clip RNG seeds.
+    #[arg(long, default_value_t = 42)]
+    pub collect_seed: u64,
+}
+
+/// Synthetic dataset collection. Renders `total_clips` MP4 clips (each
+/// `clip_duration_secs` long), ensuring exactly `fall_clips` of them
+/// contain a guaranteed fall animation segment. A `metadata.json` sidecar
+/// accompanies each clip with the camera used and timestamped fall events.
+///
+/// Each clip is recorded from exactly ONE camera chosen by a frustum
+/// visibility test: for fall clips the chosen camera must be able to see
+/// the falling NPC; for walk clips a camera is picked at random.
+///
+/// Shared args (`output_dir`, `record_fps`, `scene`) come from `render`.
+/// macOS-only (uses the same VideoToolbox recorder as `run_record`).
+#[cfg(target_os = "macos")]
+pub async fn run_collect(
+    process: RunningProcess,
+    render: RenderArgs,
+    args: CollectArgs,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<(), anyhow::Error> {
+    use crate::npc_system::{NpcSystem, Role, camera_sees_point};
+    use brush_record::{Codec, Recorder, RecorderConfig};
+    use brush_render::burn_glue::resolve_to_cube_float;
+    use brush_render::{TextureMode, gaussian_splats::render_splats};
+    use burn::tensor::s;
+    use serde_json::json;
+
+    let mut builder = env_logger::Builder::from_default_env();
+    if std::env::var("RUST_LOG").is_err() {
+        builder.filter_level(log::LevelFilter::Info);
+    }
+    let _ = builder.target(env_logger::Target::Stdout).try_init();
+
+    // load_splats_and_scene reads render.scene and render.output_dir.
+    let (splats, scene) = load_splats_and_scene(process, &render).await?;
+    tokio::fs::create_dir_all(&render.output_dir).await?;
+    let background = glam::Vec3::from(scene.background);
+
+    // Splat ambient probe — same as run_record.
+    let probe = if !scene.npcs.is_empty() {
+        let means_data = splats.means().into_data_async().await?;
+        let means_vec = means_data
+            .into_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("means readback: {e:?}"))?;
+        let sh = splats.sh_coeffs.val().slice(s![.., 0..1, ..]);
+        let sh_data = sh.into_data_async().await?;
+        let sh_vec = sh_data
+            .into_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("sh readback: {e:?}"))?;
+        let n = means_vec.len() / 3;
+        let mut positions = Vec::with_capacity(n);
+        let mut colors = Vec::with_capacity(n);
+        for i in 0..n {
+            positions.push(glam::vec3(
+                means_vec[i * 3],
+                means_vec[i * 3 + 1],
+                means_vec[i * 3 + 2],
+            ));
+            let c = glam::vec3(
+                (0.5 + SH_C0 * sh_vec[i * 3]).clamp(0.0, 1.0),
+                (0.5 + SH_C0 * sh_vec[i * 3 + 1]).clamp(0.0, 1.0),
+                (0.5 + SH_C0 * sh_vec[i * 3 + 2]).clamp(0.0, 1.0),
+            );
+            colors.push(c);
+        }
+        Some(SplatProbeData { positions, colors })
+    } else {
+        None
+    };
+
+    let scene = std::sync::Arc::new(scene);
+    let mut npc_system = NpcSystem::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Bgra8Unorm,
+        scene.clone(),
+        |anchor| match &probe {
+            Some(p) => compute_ambient_cube(anchor, p),
+            None => [[0.5, 0.5, 0.5]; 6],
+        },
+    )?;
+
+    // Filter scene cameras to the requested pool.
+    let cam_pool: Vec<&CameraEntry> = scene
+        .cameras
+        .iter()
+        .filter(|c| args.collect_cameras.contains(&c.name))
+        .collect();
+    if cam_pool.is_empty() {
+        anyhow::bail!(
+            "none of the requested cameras ({:?}) exist in scene.json",
+            args.collect_cameras
+        );
+    }
+
+    // Build shuffled clip list: `fall_clips` true entries + rest false.
+    let total = args.total_clips;
+    let fall_count = args.fall_clips.min(total);
+    let mut clip_has_fall: Vec<bool> = (0..total).map(|i| i < fall_count).collect();
+    // Fisher-Yates shuffle with our own RNG.
+    let mut rng = crate::npc_system::Rng::new(args.collect_seed);
+    for i in (1..clip_has_fall.len()).rev() {
+        let j = (rng.next_u64() as usize) % (i + 1);
+        clip_has_fall.swap(i, j);
+    }
+
+    let fps = render.record_fps;
+    let dt = 1.0 / fps as f32;
+    let total_frames = ((args.clip_duration_secs * fps as f32).ceil() as u32).max(1);
+
+    log::info!(
+        "Collecting {} clips ({} with fall, {} walk-only), {} frames each, {} cameras in pool",
+        total,
+        fall_count,
+        total - fall_count,
+        total_frames,
+        cam_pool.len(),
+    );
+    let t_overall = std::time::Instant::now();
+
+    for clip_idx in 0..total {
+        let has_fall = clip_has_fall[clip_idx as usize];
+        let clip_seed = args
+            .collect_seed
+            .wrapping_add((clip_idx as u64).wrapping_mul(6_364_136_223_846_793_005));
+
+        // Reset NPCs for this clip.
+        npc_system.reset_for_clip(clip_seed, !has_fall, &queue)?;
+
+        // For fall clips: pick a random trigger time in [2s, 7s] so the
+        // fall doesn't start at the very beginning or end of the clip.
+        let fall_trigger_t: Option<f32> = if has_fall {
+            Some(rng.range_f32(2.0, (args.clip_duration_secs - 2.0).max(2.0)))
+        } else {
+            None
+        };
+
+        // Camera selection. For fall clips, check which pool cameras can
+        // see NPC[0]'s CURRENT position at trigger time. Walk clips pick
+        // randomly. We pre-select now so the recorder can be opened at
+        // the right path before the frame loop.
+        //
+        // For fall clips we don't know the exact fall position yet (the
+        // NPC walks until trigger_t), so we check NPC[0]'s spawn position
+        // as a proxy. It's within the spawn box, which is always inside
+        // the warehouse, so the result is usually correct. If no camera
+        // passes the test we fall back to random.
+        let chosen_cam: &CameraEntry = {
+            let cam_idx = if has_fall && !npc_system.runtimes.is_empty() {
+                let npc_pos = npc_system.runtimes[0].pos;
+                let visible: Vec<usize> = cam_pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cam)| {
+                        let (img_size, fov_y_deg) = resolve_size_fov(&scene, cam);
+                        let camera = camera_from_ypr(
+                            cam.pos.into(),
+                            cam.ypr_deg.into(),
+                            fov_y_deg,
+                            img_size,
+                        );
+                        let aspect = img_size.x as f32 / img_size.y as f32;
+                        camera_sees_point(
+                            camera.world_to_local(),
+                            fov_y_deg.to_radians() as f32,
+                            aspect,
+                            npc_pos,
+                        )
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !visible.is_empty() {
+                    visible[(rng.next_u64() as usize) % visible.len()]
+                } else {
+                    (rng.next_u64() as usize) % cam_pool.len()
+                }
+            } else {
+                (rng.next_u64() as usize) % cam_pool.len()
+            };
+            cam_pool[cam_idx]
+        };
+
+        let clip_dir = render.output_dir.join(format!("clip_{clip_idx:03}"));
+        tokio::fs::create_dir_all(&clip_dir).await?;
+
+        let (img_size, fov_y_deg) = resolve_size_fov(&scene, chosen_cam);
+        let mp4_path = clip_dir.join(format!("{}.{MP4_EXT}", chosen_cam.name));
+        let mut recorder = Recorder::new(
+            device.clone(),
+            queue.clone(),
+            &mp4_path,
+            RecorderConfig {
+                width: img_size.x,
+                height: img_size.y,
+                fps,
+                codec: Codec::Hevc,
+            },
+        )?;
+
+        // Per-clip state tracking.
+        let npc_count = npc_system.runtimes.len();
+        let mut prev_roles: Vec<Option<Role>> = vec![None; npc_count];
+        // Each entry: (npc_name, variant, start_sec, Option<end_sec>)
+        let mut fall_events: Vec<(String, String, f32, Option<f32>)> = Vec::new();
+        let mut fall_injected = false;
+
+        for frame in 0..total_frames {
+            let world_t = frame as f32 * dt;
+
+            // Inject fall: set force_next_role on NPC[0] and expire its
+            // current step so the transition fires on this tick.
+            if let Some(trigger) = fall_trigger_t {
+                if !fall_injected && world_t >= trigger {
+                    if let Some(rt) = npc_system.runtimes.first_mut() {
+                        if let Some(brain) = rt.brain.as_mut() {
+                            brain.force_next_role = Some(if rng.next_f32() < 0.5 {
+                                Role::Fall
+                            } else {
+                                Role::FallSide
+                            });
+                            // Force step expiry so tick() calls next_brain_step
+                            // this frame rather than waiting for natural expiry.
+                            brain.elapsed = f32::INFINITY;
+                        }
+                    }
+                    fall_injected = true;
+                }
+            }
+
+            npc_system.tick(dt, &queue)?;
+
+            // Observe role transitions to timestamp fall segments.
+            for i in 0..npc_count {
+                let rt = &npc_system.runtimes[i];
+                let cur_role = rt.brain.as_ref().map(|b| b.step.role);
+                let prev = prev_roles[i];
+
+                let is_falling = matches!(cur_role, Some(Role::Fall) | Some(Role::FallSide));
+                let was_falling = matches!(prev, Some(Role::Fall) | Some(Role::FallSide));
+
+                if is_falling && !was_falling {
+                    let variant = match cur_role {
+                        Some(Role::Fall) => "Fall",
+                        Some(Role::FallSide) => "fall_side",
+                        _ => "Fall",
+                    };
+                    let npc_name = scene.npcs[rt.scene_index].name.clone();
+                    fall_events.push((npc_name, variant.to_string(), world_t, None));
+                } else if was_falling && !is_falling {
+                    // Close the most recent open event for this NPC.
+                    let npc_name = &scene.npcs[rt.scene_index].name;
+                    if let Some(ev) = fall_events
+                        .iter_mut()
+                        .rev()
+                        .find(|(n, _, _, end)| n == npc_name && end.is_none())
+                    {
+                        ev.3 = Some(world_t);
+                    }
+                }
+                prev_roles[i] = cur_role;
+            }
+
+            // Render the single chosen camera.
+            let camera = camera_from_ypr(
+                chosen_cam.pos.into(),
+                chosen_cam.ypr_deg.into(),
+                fov_y_deg,
+                img_size,
+            );
+
+            let (tensor, aux) = render_splats(
+                splats.clone(),
+                &camera,
+                img_size,
+                background,
+                None,
+                TextureMode::Packed,
+            )
+            .await;
+            let cube_color = resolve_to_cube_float(tensor);
+            let resource_color = cube_color
+                .client
+                .get_resource(cube_color.handle.clone())
+                .map_err(|e| anyhow::anyhow!("get_resource (color): {e:?}"))?;
+            let cube_depth = resolve_to_cube_float(aux.depth_img);
+            let resource_depth = cube_depth
+                .client
+                .get_resource(cube_depth.handle.clone())
+                .map_err(|e| anyhow::anyhow!("get_resource (depth): {e:?}"))?;
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let res = resource_color.resource();
+            let depth_res = resource_depth.resource();
+
+            let mut frame_handle = recorder.begin_frame()?;
+            frame_handle.swizzle_from(&res.buffer, res.offset);
+
+            if !npc_system.runtimes.is_empty() {
+                let aspect = img_size.x as f32 / img_size.y as f32;
+                let view_proj = crate::npc_system::view_projection(
+                    camera.world_to_local(),
+                    fov_y_deg.to_radians() as f32,
+                    aspect,
+                );
+                npc_system.mesh_renderer.set_camera(&queue, view_proj, camera.position);
+                npc_system.mesh_renderer.fill_depth_from_splats(
+                    &device,
+                    &queue,
+                    frame_handle.color_texture(),
+                    &depth_res.buffer,
+                    depth_res.offset,
+                    0.05,
+                    1000.0,
+                );
+                let sub = npc_system.render_npcs(&device, &queue, frame_handle.color_texture(), None);
+                frame_handle.note_submission(sub);
+            }
+
+            frame_handle.finish()?;
+        }
+
+        // Close any fall events still open at clip end.
+        for ev in &mut fall_events {
+            ev.3.get_or_insert(args.clip_duration_secs);
+        }
+
+        recorder.finish().await?;
+
+        // Write metadata.json sidecar.
+        let events_json: Vec<serde_json::Value> = fall_events
+            .iter()
+            .map(|(npc, variant, start, end)| {
+                json!({
+                    "npc": npc,
+                    "variant": variant,
+                    "start_sec": (start * 1000.0).round() / 1000.0,
+                    "end_sec": end.map(|e| (e * 1000.0).round() / 1000.0),
+                })
+            })
+            .collect();
+        let metadata = json!({
+            "clip_id": clip_idx,
+            "has_fall": has_fall,
+            "duration_secs": args.clip_duration_secs,
+            "camera": chosen_cam.name,
+            "fall_events": events_json,
+        });
+        let meta_path = clip_dir.join("metadata.json");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata)?)?;
+
+        log::info!(
+            "clip {:03}/{} done  has_fall={:<5}  cam={}  fall_events={}",
+            clip_idx + 1,
+            total,
+            has_fall,
+            chosen_cam.name,
+            fall_events.len(),
+        );
+    }
+
+    let elapsed = t_overall.elapsed();
+    log::info!(
+        "Dataset complete: {} clips in {:.1?}  ({:.1} s/clip avg)",
+        total,
+        elapsed,
+        elapsed.as_secs_f64() / total as f64,
     );
     Ok(())
 }

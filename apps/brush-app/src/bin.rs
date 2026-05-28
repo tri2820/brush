@@ -80,7 +80,10 @@ fn main() -> Result<(), anyhow::Error> {
             });
 
             #[cfg(target_os = "macos")]
-            if args.render.record_frames.is_some() {
+            if args.render.record_frames.is_some() || args.collect.collect {
+                if args.collect.collect && args.render.scene.is_none() {
+                    anyhow::bail!("--collect requires a .json scene file as the positional argument");
+                }
                 // Build wgpu Instance/Adapter/Device/Queue manually so we
                 // own handles the recorder (IOSurface texture import,
                 // swizzle compute) can share with burn.
@@ -121,8 +124,12 @@ fn main() -> Result<(), anyhow::Error> {
                 // `burn_init_device` consumes adapter; clones of
                 // device/queue stay for our recorder.
                 brush_process::burn_init_device(adapter, device.clone(), queue.clone());
-                let process = init_process.expect("Must provide a source for --record-frames");
-                brush_cli::run_record(process, args.render, device, queue).await?;
+                let process = init_process.expect("Must provide a source");
+                if args.collect.collect {
+                    brush_cli::run_collect(process, args.render, args.collect, device, queue).await?;
+                } else {
+                    brush_cli::run_record(process, args.render, device, queue).await?;
+                }
                 return anyhow::Result::<(), anyhow::Error>::Ok(());
             }
 

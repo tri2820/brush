@@ -112,6 +112,13 @@ pub struct Brain {
     /// force the step to expire so the next roll picks a fresh azimuth.
     pub last_pos_xz: Vec3,
     pub stuck_secs: f32,
+    /// When true, `next_brain_step` never rolls Fall/FallSide — used
+    /// for walk-only dataset clips.
+    pub walk_only: bool,
+    /// If `Some`, the next call to `next_brain_step` consumes this role
+    /// instead of rolling the RNG. Used by `run_collect` to guarantee a
+    /// fall fires at a specific world time.
+    pub force_next_role: Option<Role>,
 }
 
 /// Per-NPC mutable state.
@@ -284,6 +291,8 @@ impl NpcSystem {
                 last_direction: Vec3::ZERO,
                 last_pos_xz: initial_pos,
                 stuck_secs: 0.0,
+                walk_only: false,
+                force_next_role: None,
             });
 
             let (spawn_min_xz, spawn_max_xz) = match &npc.brain {
@@ -497,6 +506,71 @@ impl NpcSystem {
         Ok(())
     }
 
+    /// Reset all NPC runtime state for a new dataset clip without
+    /// re-allocating GPU resources (mesh/material/renderer are reused).
+    ///
+    /// `clip_seed` is used to deterministically scatter NPCs to different
+    /// spawn positions each clip. `walk_only` suppresses Fall/FallSide
+    /// roles for the 70 non-fall clips.
+    pub fn reset_for_clip(
+        &mut self,
+        clip_seed: u64,
+        walk_only: bool,
+        queue: &wgpu::Queue,
+    ) -> Result<()> {
+        self.world_t = 0.0;
+        for ri in 0..self.runtimes.len() {
+            let scene_index = self.runtimes[ri].scene_index;
+            let scene_npc = &self.scene.npcs[scene_index];
+            let asset = &self
+                .mesh_cache
+                .get(&scene_npc.asset)
+                .expect("preloaded")
+                .mesh;
+
+            // Deterministic per-NPC-per-clip spawn position inside the box.
+            let mut rng = Rng::new(clip_seed.wrapping_add(ri as u64 * 6_364_136_223_846_793_005));
+            let rt = &mut self.runtimes[ri];
+
+            rt.pos = Vec3::new(
+                rng.range_f32(rt.spawn_min_xz.x, rt.spawn_max_xz.x),
+                self.floor_y,
+                rng.range_f32(rt.spawn_min_xz.z, rt.spawn_max_xz.z),
+            );
+            rt.yaw_deg = scene_npc.yaw_deg;
+            rt.step_anim_t = 0.0;
+            rt.current_anim_index = None; // bind pose until first step fires
+
+            if let Some(brain) = rt.brain.as_mut() {
+                *brain = Brain {
+                    rng: Rng::new(clip_seed.wrapping_add(ri as u64 * 2_654_435_761)),
+                    step: TimelineStep {
+                        role: Role::Idle,
+                        duration: 0.3,
+                        direction: Vec3::ZERO,
+                        anim_name: None,
+                    },
+                    elapsed: 0.0,
+                    last_direction: Vec3::ZERO,
+                    last_pos_xz: rt.pos,
+                    stuck_secs: 0.0,
+                    walk_only,
+                    force_next_role: None,
+                };
+            }
+
+            // Re-upload model matrix and bind-pose skin to GPU.
+            let model = model_matrix(scene_npc.scale, rt.yaw_deg, rt.pos);
+            let color = scene_npc.color;
+            let ambient = rt.instance.ambient_cube;
+            rt.instance.set_model(queue, model, color, ambient);
+
+            let skin = asset.skeleton.evaluate(None, 0.0, true);
+            rt.instance.upload_skin(queue, &skin)?;
+        }
+        Ok(())
+    }
+
     /// Issue the mesh pass for all NPCs into `color_texture`. Camera
     /// uniforms must already be set via `mesh_renderer.set_camera` (and
     /// optionally `fill_depth_from_splats` for record mode's depth
@@ -536,33 +610,71 @@ impl NpcSystem {
 /// `anim_table[Role]` provides the per-NPC animation index for each
 /// role; `clip_dur` gives the duration of a clip by `Option<idx>`
 /// (returns a sensible fallback when the glb doesn't ship that clip).
+///
+/// Priority order:
+/// 1. `brain.force_next_role` — consumed and played immediately (used by
+///    `run_collect` to inject a guaranteed fall at a specific world time).
+/// 2. `brain.walk_only` — suppresses Fall/FallSide; always walks.
+/// 3. Normal RNG roll.
 fn next_brain_step(
     brain: &mut Brain,
     anim_table: &[Option<usize>; 4],
     clip_dur: impl Fn(Option<usize>) -> f32,
 ) -> TimelineStep {
+    // Priority 1: externally injected role.
+    if let Some(role) = brain.force_next_role.take() {
+        return make_step_for_role(role, brain, anim_table, &clip_dur);
+    }
+    // Priority 2: walk-only mode (dataset collection).
+    if brain.walk_only {
+        return make_walk_step(brain);
+    }
+    // Priority 3: normal RNG.
     let r = brain.rng.next_f32();
     if r < P_WALK {
-        TimelineStep {
-            role: Role::Walk,
-            duration: brain.rng.range_f32(STEP_MIN, STEP_MAX),
-            direction: random_direction(&mut brain.rng, brain.last_direction),
-            anim_name: Some("Walk"),
-        }
+        make_walk_step(brain)
     } else if r < P_WALK + P_FALL {
-        TimelineStep {
+        make_step_for_role(Role::Fall, brain, anim_table, &clip_dur)
+    } else {
+        make_step_for_role(Role::FallSide, brain, anim_table, &clip_dur)
+    }
+}
+
+fn make_walk_step(brain: &mut Brain) -> TimelineStep {
+    TimelineStep {
+        role: Role::Walk,
+        duration: brain.rng.range_f32(STEP_MIN, STEP_MAX),
+        direction: random_direction(&mut brain.rng, brain.last_direction),
+        anim_name: Some("Walk"),
+    }
+}
+
+fn make_step_for_role(
+    role: Role,
+    brain: &mut Brain,
+    anim_table: &[Option<usize>; 4],
+    clip_dur: &impl Fn(Option<usize>) -> f32,
+) -> TimelineStep {
+    match role {
+        Role::Walk => make_walk_step(brain),
+        Role::Idle => TimelineStep {
+            role: Role::Idle,
+            duration: 0.5,
+            direction: Vec3::ZERO,
+            anim_name: None,
+        },
+        Role::Fall => TimelineStep {
             role: Role::Fall,
             duration: clip_dur(anim_table[2]),
             direction: Vec3::ZERO,
             anim_name: Some("Fall"),
-        }
-    } else {
-        TimelineStep {
+        },
+        Role::FallSide => TimelineStep {
             role: Role::FallSide,
             duration: clip_dur(anim_table[3]),
             direction: Vec3::ZERO,
             anim_name: Some("fall_side"),
-        }
+        },
     }
 }
 
@@ -591,6 +703,23 @@ pub fn model_matrix(scale: f32, yaw_deg: f32, pos: Vec3) -> Mat4 {
     let rot = Quat::from_rotation_y(yaw_deg.to_radians())
         * Quat::from_rotation_x(std::f32::consts::PI);
     Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos)
+}
+
+/// Returns `true` if `point` projects inside the camera frustum defined
+/// by `cam_world_to_local`, `fov_y_rad`, and `aspect` (width/height).
+/// Used by `run_collect` to choose which camera can actually see a fall.
+///
+/// "Inside" means NDC x∈[-1,1], y∈[-1,1], z∈[0,1] after applying the
+/// same `view_projection` helper used for the mesh render pass.
+pub fn camera_sees_point(
+    cam_world_to_local: glam::Affine3A,
+    fov_y_rad: f32,
+    aspect: f32,
+    point: Vec3,
+) -> bool {
+    let vp = view_projection(cam_world_to_local, fov_y_rad, aspect);
+    let ndc = vp.project_point3(point);
+    ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && ndc.z >= 0.0 && ndc.z <= 1.0
 }
 
 /// Canonical view-projection for the NPC mesh pass. Both record and
