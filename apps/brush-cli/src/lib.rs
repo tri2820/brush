@@ -1029,6 +1029,14 @@ pub async fn run_collect(
         cam_pool.len(),
     );
     let t_overall = std::time::Instant::now();
+    // Round-robin counters: ensures each camera in the pool gets roughly
+    // equal representation across fall clips and walk clips separately.
+    // Frustum-at-spawn-time was the previous approach but it was biased
+    // toward wide cameras (which cover more of the spawn box) and picked
+    // at the wrong time (NPC walks 2-7s before falling, ending up
+    // somewhere completely different from its spawn position).
+    let mut fall_cam_counter: usize = 0;
+    let mut walk_cam_counter: usize = 0;
 
     for clip_idx in 0..total {
         let has_fall = clip_has_fall[clip_idx as usize];
@@ -1047,49 +1055,18 @@ pub async fn run_collect(
             None
         };
 
-        // Camera selection. For fall clips, check which pool cameras can
-        // see NPC[0]'s CURRENT position at trigger time. Walk clips pick
-        // randomly. We pre-select now so the recorder can be opened at
-        // the right path before the frame loop.
-        //
-        // For fall clips we don't know the exact fall position yet (the
-        // NPC walks until trigger_t), so we check NPC[0]'s spawn position
-        // as a proxy. It's within the spawn box, which is always inside
-        // the warehouse, so the result is usually correct. If no camera
-        // passes the test we fall back to random.
-        let chosen_cam: &CameraEntry = {
-            let cam_idx = if has_fall && !npc_system.runtimes.is_empty() {
-                let npc_pos = npc_system.runtimes[0].pos;
-                let visible: Vec<usize> = cam_pool
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, cam)| {
-                        let (img_size, fov_y_deg) = resolve_size_fov(&scene, cam);
-                        let camera = camera_from_ypr(
-                            cam.pos.into(),
-                            cam.ypr_deg.into(),
-                            fov_y_deg,
-                            img_size,
-                        );
-                        let aspect = img_size.x as f32 / img_size.y as f32;
-                        camera_sees_point(
-                            camera.world_to_local(),
-                            fov_y_deg.to_radians() as f32,
-                            aspect,
-                            npc_pos,
-                        )
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                if !visible.is_empty() {
-                    visible[(rng.next_u64() as usize) % visible.len()]
-                } else {
-                    (rng.next_u64() as usize) % cam_pool.len()
-                }
-            } else {
-                (rng.next_u64() as usize) % cam_pool.len()
-            };
-            cam_pool[cam_idx]
+        // Camera selection — round-robin within each class (fall / walk)
+        // so both cameras get equal representation in the dataset.
+        // Fall clips cycle through cam_pool independently from walk clips
+        // so neither class is starved.
+        let chosen_cam: &CameraEntry = if has_fall {
+            let idx = fall_cam_counter % cam_pool.len();
+            fall_cam_counter += 1;
+            cam_pool[idx]
+        } else {
+            let idx = walk_cam_counter % cam_pool.len();
+            walk_cam_counter += 1;
+            cam_pool[idx]
         };
 
         let clip_dir = render.output_dir.join(format!("clip_{clip_idx:03}"));
