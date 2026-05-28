@@ -1055,15 +1055,70 @@ pub async fn run_collect(
             None
         };
 
-        // Camera selection — round-robin within each class (fall / walk)
-        // so both cameras get equal representation in the dataset.
-        // Fall clips cycle through cam_pool independently from walk clips
-        // so neither class is starved.
+        // Camera selection:
+        // - Walk clips: round-robin across the pool so both cameras get
+        //   equal representation.
+        // - Fall clips: pre-simulate the NPC path to the fall trigger frame
+        //   (no GPU render) to find where NPC[0] will be when it falls, then
+        //   choose the camera whose frustum contains that position. If neither
+        //   camera sees the point, fall back to round-robin. This guarantees
+        //   every fall clip actually captures the fall in frame.
         let chosen_cam: &CameraEntry = if has_fall {
-            let idx = fall_cam_counter % cam_pool.len();
-            fall_cam_counter += 1;
-            cam_pool[idx]
+            let trigger = fall_trigger_t.expect("has_fall implies trigger is Some");
+            let trigger_frame = (trigger * fps as f32) as u32;
+
+            // Pre-sim: walk_only=true so no random fall fires before trigger.
+            npc_system.reset_for_clip(clip_seed, true, &queue)?;
+            for _ in 0..trigger_frame {
+                npc_system.tick(dt, &queue)?;
+            }
+            let fall_npc_pos = npc_system.runtimes.first().map(|rt| rt.pos).unwrap_or_default();
+
+            // Reset to the real walk_only=false state for actual recording.
+            npc_system.reset_for_clip(clip_seed, !has_fall, &queue)?;
+
+            // Score each pool camera by whether it contains fall_npc_pos.
+            let visible_cams: Vec<&CameraEntry> = cam_pool
+                .iter()
+                .copied()
+                .filter(|cam| {
+                    let (img_size, fov_y_deg) = resolve_size_fov(&scene, cam);
+                    let camera = camera_from_ypr(
+                        cam.pos.into(),
+                        cam.ypr_deg.into(),
+                        fov_y_deg,
+                        img_size,
+                    );
+                    let aspect = img_size.x as f32 / img_size.y as f32;
+                    camera_sees_point(
+                        camera.world_to_local(),
+                        fov_y_deg.to_radians() as f32,
+                        aspect,
+                        fall_npc_pos,
+                    )
+                })
+                .collect();
+
+            if !visible_cams.is_empty() {
+                let idx = fall_cam_counter % visible_cams.len();
+                fall_cam_counter += 1;
+                visible_cams[idx]
+            } else {
+                // Fallback: round-robin when no camera has line-of-sight
+                // (NPC at far spawn corner — very rare with current bounds).
+                log::warn!(
+                    "clip {:03}: fall NPC at ({:.1},{:.1}) not in any camera frustum — using round-robin",
+                    clip_idx, fall_npc_pos.x, fall_npc_pos.z
+                );
+                let idx = fall_cam_counter % cam_pool.len();
+                fall_cam_counter += 1;
+                cam_pool[idx]
+            }
         } else {
+            // Walk clips: round-robin. The "no fall" label is valid from
+            // any camera angle; the wide camera is a superset of the floor
+            // camera's coverage within our spawn bounds, so score-based
+            // selection always ties — round-robin gives equal representation.
             let idx = walk_cam_counter % cam_pool.len();
             walk_cam_counter += 1;
             cam_pool[idx]
